@@ -116,7 +116,7 @@ typedef struct MySQLFdwExecState
 
 	List            *attr_list;         /* query attribute list */
 	List            *column_list;       /* Column list of MySQL Column structures */
-
+	bool 			is_tlist_pushdown;      /* pushdown target list or not */
 	/* working memory context */
 	MemoryContext   temp_cxt;           /* context for per-tuple temporary data */
 } MySQLFdwExecState;
@@ -130,7 +130,7 @@ typedef struct MySQLColumn
 	int   atttype;         /* Attribute type */
 } MySQLColumn;
 
-extern bool is_foreign_expr(PlannerInfo *root,
+extern bool mysql_is_foreign_expr(PlannerInfo *root,
                                 RelOptInfo *baserel,
                                 Expr *expr);
 
@@ -184,7 +184,7 @@ extern mysql_opt *mysql_get_options(Oid foreigntableid);
 
 /* depare.c headers */
 extern void mysql_deparse_select(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel,
-							 Bitmapset *attrs_used, char *svr_table, List **retrieved_attrs);
+							 Bitmapset *attrs_used, char *svr_table, List **retrieved_attrs, List *tlist);
 extern void mysql_deparse_insert(StringInfo buf, PlannerInfo *root, Index rtindex, Relation rel, List *targetAttrs);
 extern void mysql_deparse_update(StringInfo buf, PlannerInfo *root, Index rtindex, Relation rel, List *targetAttrs, char *attname);
 extern void mysql_deparse_delete(StringInfo buf, PlannerInfo *root, Index rtindex, Relation rel, char *name);
