@@ -28,6 +28,13 @@ CREATE FOREIGN DATA WRAPPER mysql_fdw
   HANDLER mysql_fdw_handler
   VALIDATOR mysql_fdw_validator;
 
+CREATE FUNCTION MATCH_AGAINST(varidiadic text[]) RETURNS INT AS $$
+BEGIN
+  RETURN 1;
+END
+$$ LANGUAGE plpgsql IMMUTABLE;
+
 CREATE OR REPLACE FUNCTION mysql_fdw_version()
   RETURNS pg_catalog.int4 STRICT
   AS 'MODULE_PATHNAME' LANGUAGE C;
+
