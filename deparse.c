@@ -1177,20 +1177,42 @@ mysql_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node, deparse_expr_cxt *co
 	/* Sanity check. */
 	Assert(list_length(node->args) == 2);
 
-	/* Deparse left operand. */
-	arg1 = linitial(node->args);
-	deparseExpr(arg1, context);
-	appendStringInfoChar(buf, ' ');
-
 	opname = NameStr(form->oprname);
-	if (strcmp(opname, "<>") == 0)
-		appendStringInfo(buf, " NOT ");
 
-	/* Deparse operator name plus decoration. */
-	appendStringInfo(buf, " IN (");
-
-	/* Deparse right operand. */
+	/*
+	 * Deparse right operand to check type of argument first.
+	 * For an fixed-len array, we use IN clause, e.g. ANY(ARRAY[1, 2, 3]).
+	 * For an variable-len array, we use FIND_IN_SET clause, e.g. ANY(ARRAY(SELECT * FROM table),
+	 * because we can bind a string representation of array.
+	 */
 	arg2 = lsecond(node->args);
+	if (nodeTag((Node*)arg2) == T_Const)
+	{
+		/* Deparse left operand. */
+		arg1 = linitial(node->args);
+		deparseExpr(arg1, context);
+		appendStringInfoChar(buf, ' ');
+
+		if (strcmp(opname, "<>") == 0)
+			appendStringInfo(buf, " NOT ");
+
+		/* Deparse operator name plus decoration. */
+		appendStringInfo(buf, " IN (");
+	}
+	else
+	{
+		if (strcmp(opname, "<>") == 0)
+			appendStringInfo(buf, " NOT ");
+
+		/* Use FIND_IN_SET for binding the array parameter */
+		appendStringInfo(buf, " FIND_IN_SET (");
+
+		/* Deparse left operand. */
+		arg1 = linitial(node->args);
+		deparseExpr(arg1, context);
+		appendStringInfoChar(buf, ',');
+	}
+
 	switch (nodeTag((Node*)arg2))
 	{
 		case T_Const:
