@@ -937,6 +937,16 @@ mysql_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 	ListCell       *arg;
 
 	/*
+	 * If the function call came from an implicit coercion, then just show the
+	 * first argument.
+	 */
+	if (node->funcformat == COERCE_IMPLICIT_CAST)
+	{
+		deparseExpr((Expr *) linitial(node->args), context);
+		return;
+	}
+
+	/*
 	 * Normal function: display as proname(args).
 	 */
 	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(node->funcid));
