@@ -157,7 +157,7 @@ mysql_convert_to_pg(Oid pgtyp, int pgtypmod, mysql_column *column)
 		case BITOID:
 			sprintf(str, "%d", dec_bin(*((int*)column->value)));
 			valueDatum = CStringGetDatum((char*)str);
-		break;
+			break;
 		default:
 			valueDatum = CStringGetDatum((char*)column->value);
 	}
@@ -195,6 +195,8 @@ mysql_from_pgtyp(Oid type)
 		case BOOLOID:
 			return MYSQL_TYPE_LONG;
 
+		/* TODO: We may have to add more type of array */
+		case INT2ARRAYOID:
 		case BPCHAROID:
 		case VARCHAROID:
 		case TEXTOID:
@@ -312,6 +314,8 @@ mysql_bind_sql_var(Oid type, int attnum, Datum value, MYSQL_BIND *binds, bool *i
 			break;
 		}
 
+		/* TODO: We may have to add more type of array */
+		case INT2ARRAYOID:
 		case BPCHAROID:
 		case VARCHAROID:
 		case TEXTOID:
@@ -418,7 +422,6 @@ mysql_bind_sql_var(Oid type, int attnum, Datum value, MYSQL_BIND *binds, bool *i
 			binds[attnum].buffer_length = len;
 			break;
 		}
-
 		default:
 		{
 			ereport(ERROR, (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
@@ -457,6 +460,7 @@ mysql_bind_result(Oid pgtyp, int pgtypmod, MYSQL_FIELD *field, mysql_column *col
 					column->value = (Datum) palloc0(MAXDATALEN);
 					mbind->buffer = (char *) column->value;
 					mbind->buffer_length = MAXDATALEN;
+					break;
 	}
 }
 
