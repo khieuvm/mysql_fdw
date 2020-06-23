@@ -11,7 +11,6 @@
  *
  *-------------------------------------------------------------------------
  */
-
 #ifndef MYSQL_FDW_H
 #define MYSQL_FDW_H
 
@@ -32,7 +31,6 @@
 #else
 #include "nodes/pathnodes.h"
 #endif
-
 #include "utils/rel.h"
 
 #define MYSQL_PREFETCH_ROWS	100
@@ -43,8 +41,39 @@
 #define WAIT_TIMEOUT		0
 #define INTERACTIVE_TIMEOUT 0
 
-
 #define CR_NO_ERROR 0
+
+#define mysql_options (*_mysql_options)
+#define mysql_stmt_prepare (*_mysql_stmt_prepare)
+#define mysql_stmt_execute (*_mysql_stmt_execute)
+#define mysql_stmt_fetch (*_mysql_stmt_fetch)
+#define mysql_query (*_mysql_query)
+#define mysql_stmt_attr_set (*_mysql_stmt_attr_set)
+#define mysql_stmt_close (*_mysql_stmt_close)
+#define mysql_stmt_reset (*_mysql_stmt_reset)
+#define mysql_free_result (*_mysql_free_result)
+#define mysql_stmt_bind_param (*_mysql_stmt_bind_param)
+#define mysql_stmt_bind_result (*_mysql_stmt_bind_result)
+#define mysql_stmt_init (*_mysql_stmt_init)
+#define mysql_stmt_result_metadata (*_mysql_stmt_result_metadata)
+#define mysql_stmt_store_result (*_mysql_stmt_store_result)
+#define mysql_fetch_row (*_mysql_fetch_row)
+#define mysql_fetch_field (*_mysql_fetch_field)
+#define mysql_fetch_fields (*_mysql_fetch_fields)
+#define mysql_error (*_mysql_error)
+#define mysql_close (*_mysql_close)
+#define mysql_store_result (*_mysql_store_result)
+#define mysql_init (*_mysql_init)
+#define mysql_ssl_set (*_mysql_ssl_set)
+#define mysql_real_connect (*_mysql_real_connect)
+#define mysql_get_host_info (*_mysql_get_host_info)
+#define mysql_get_server_info (*_mysql_get_server_info)
+#define mysql_get_proto_info (*_mysql_get_proto_info)
+#define mysql_stmt_errno (*_mysql_stmt_errno)
+#define mysql_errno (*_mysql_errno)
+#define mysql_num_fields (*_mysql_num_fields)
+#define mysql_num_rows (*_mysql_num_rows)
+
 /*
  * Options structure to store the MySQL
  * server information
@@ -82,16 +111,15 @@ typedef struct mysql_column
 	unsigned long length;
 	bool		is_null;
 	bool		error;
-	MYSQL_BIND *_mysql_bind;
+	MYSQL_BIND *mysql_bind;
 } mysql_column;
 
 typedef struct mysql_table
 {
-	MYSQL_RES  *_mysql_res;
-	MYSQL_FIELD *_mysql_fields;
-
+	MYSQL_RES  *mysql_res;
+	MYSQL_FIELD *mysql_fields;
 	mysql_column *column;
-	MYSQL_BIND *_mysql_bind;
+	MYSQL_BIND *mysql_bind;
 } mysql_table;
 
 /*
@@ -106,14 +134,12 @@ typedef struct MySQLFdwExecState
 	char	   *query;			/* Query string */
 	Relation	rel;			/* relcache entry for the foreign table */
 	List	   *retrieved_attrs;	/* list of target attribute numbers */
-
 	bool		cursor_exists;	/* have we created the cursor? */
 	int			numParams;		/* number of parameters passed to query */
 	FmgrInfo   *param_flinfo;	/* output conversion functions for them */
 	List	   *param_exprs;	/* executable expressions for param values */
 	const char **param_values;	/* textual values of query parameters */
 	Oid		   *param_types;	/* type of query parameters */
-
 	int			p_nums;			/* number of parameters to transmit */
 	FmgrInfo   *p_flinfo;		/* output conversion functions for them */
 
@@ -121,7 +147,6 @@ typedef struct MySQLFdwExecState
 
 	List	   *attr_list;		/* query attribute list */
 	List	   *column_list;	/* Column list of MySQL Column structures */
-
 	/* working memory context */
 	MemoryContext temp_cxt;		/* context for per-tuple temporary data */
 } MySQLFdwExecState;
@@ -200,13 +225,11 @@ extern void mysql_deparse_analyze(StringInfo buf, char *dbname, char *relname);
 
 
 /* connection.c headers */
-MYSQL *mysql_get_connection(ForeignServer *server, UserMapping *user, mysql_opt *opt);
-MYSQL *mysql_connect(char *svr_address, char *svr_username, char *svr_password, char *svr_database,
-					 int svr_port, bool svr_sa, char *svr_init_command,
-					 char *ssl_key, char *ssl_cert, char *ssl_ca, char *ssl_capath,
-					 char *ssl_cipher);
+MYSQL *mysql_get_connection(ForeignServer *server, UserMapping *user,
+							mysql_opt *opt);
+MYSQL *mysql_connect(mysql_opt *opt);
 void mysql_cleanup_connection(void);
-void mysql_rel_connection(MYSQL *conn);
+void mysql_release_connection(MYSQL *conn);
 
 #if PG_VERSION_NUM < 110000		/* TupleDescAttr is defined from PG version 11 */
 #define TupleDescAttr(tupdesc, i) ((tupdesc)->attrs[(i)])
