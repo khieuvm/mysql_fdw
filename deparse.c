@@ -43,6 +43,8 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 
+/* Return true if integer type */
+#define IS_INTEGER_TYPE(typid) ((typid == INT2OID) || (typid == INT4OID) || (typid == INT8OID))
 
 static char *mysql_quote_identifier(const char *s, char q);
 
@@ -114,6 +116,7 @@ static void mysql_deparse_relation(StringInfo buf, Relation rel);
 static void mysql_deparse_target_list(StringInfo buf, PlannerInfo *root, Index rtindex, Relation rel,
 					Bitmapset *attrs_used, List **retrieved_attrs, List *tlist, RelOptInfo *baserel);
 static void mysql_deparse_column_ref(StringInfo buf, int varno, int varattno, PlannerInfo *root);
+static bool mysql_deparse_op_divide(Expr *node, deparse_expr_cxt *context);
 
 /*
  * Functions to construct string representation of a specific types.
@@ -937,6 +940,16 @@ mysql_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 	ListCell       *arg;
 
 	/*
+	 * If the function call came from an implicit coercion, then just show the
+	 * first argument.
+	 */
+	if (node->funcformat == COERCE_IMPLICIT_CAST)
+	{
+		deparseExpr((Expr *) linitial(node->args), context);
+		return;
+	}
+
+	/*
 	 * Normal function: display as proname(args).
 	 */
 	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(node->funcid));
@@ -1023,6 +1036,103 @@ mysql_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 }
 
 /*
+ * In Postgres, with divide operand '/', the results is integer with
+ * truncates which different with mysql.
+ * In mysql, with divide operand '/', the results is the scale
+ * of the first operand plus the value of the div_precision_increment
+ * system variable (which is 4 by default)
+ *
+ * To make Postgres consistence with mysql in this case, we will do follow:
+ *  + Check operands recursively.
+ *  + If all operands are non floating point type, change '/' to 'DIV'.
+ */
+static bool
+mysql_deparse_op_divide(Expr *node, deparse_expr_cxt *context)
+{
+	bool is_convert = true;
+
+	if (node == NULL)
+		return false;
+
+	switch (nodeTag(node))
+	{
+		case T_Var:
+			{
+				Var		   		*var = (Var *) node;
+				RangeTblEntry 	*rte;
+				PlannerInfo 	*root = context->root;
+				int				col_type = 0;
+				int				varno = var->varno;
+				int				varattno = var->varattno;
+
+				/* varno must not be any of OUTER_VAR, INNER_VAR and INDEX_VAR. */
+				Assert(!IS_SPECIAL_VARNO(varno));
+
+				/* Get RangeTblEntry from array in PlannerInfo. */
+				rte = planner_rt_fetch(varno, root);
+
+				col_type = get_atttype(rte->relid, varattno);
+				is_convert = IS_INTEGER_TYPE(col_type);
+			}
+			break;
+		case T_Const:
+			{
+				Const	   *c = (Const *) node;
+				is_convert = IS_INTEGER_TYPE(c->consttype);
+			}
+			break;
+		case T_FuncExpr:
+			{
+				FuncExpr *f = (FuncExpr *) node;
+				is_convert = IS_INTEGER_TYPE(f->funcresulttype);
+			}
+			break;
+		case T_OpExpr:
+			{
+				HeapTuple	tuple;
+				Form_pg_operator form;
+				char		oprkind;
+				ListCell   *arg;
+
+				OpExpr *op = (OpExpr *) node;
+
+				/* Retrieve information about the operator from system catalog. */
+				tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(op->opno));
+				if (!HeapTupleIsValid(tuple))
+					elog(ERROR, "cache lookup failed for operator %u", op->opno);
+				form = (Form_pg_operator) GETSTRUCT(tuple);
+				oprkind = form->oprkind;
+
+				/* Sanity check. */
+				Assert((oprkind == 'r' && list_length(op->args) == 1) ||
+					(oprkind == 'l' && list_length(op->args) == 1) ||
+					(oprkind == 'b' && list_length(op->args) == 2));
+				/* Check left operand. */
+				if (oprkind == 'r' || oprkind == 'b')
+				{
+					arg = list_head(op->args);
+					is_convert = mysql_deparse_op_divide(lfirst(arg), context);
+				}
+
+				/* If left operand is ok, going to check right operand. */
+				if (is_convert && (oprkind == 'l' || oprkind == 'b'))
+				{
+					arg = list_tail(op->args);
+					is_convert = is_convert ? mysql_deparse_op_divide(lfirst(arg), context) : false;
+				}
+				ReleaseSysCache(tuple);
+			}
+			break;
+		default:
+			is_convert = false;
+			elog(ERROR, "unsupported expression type for check type operand for convert divide : %d",
+				 (int) nodeTag(node));
+			break;
+	}
+	return is_convert;
+}
+
+/*
  * Deparse given operator expression.   To avoid problems around
  * priority of operations, we always parenthesize the arguments.
  */
@@ -1034,6 +1144,7 @@ mysql_deparse_op_expr(OpExpr *node, deparse_expr_cxt *context)
 	Form_pg_operator form;
 	char		oprkind;
 	ListCell   *arg;
+	bool		is_convert = false; /* Flag to determine that convert '/' to 'DIV' or not */
 
 	/* Retrieve information about the operator from system catalog. */
 	tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(node->opno));
@@ -1047,6 +1158,11 @@ mysql_deparse_op_expr(OpExpr *node, deparse_expr_cxt *context)
 		   (oprkind == 'l' && list_length(node->args) == 1) ||
 		   (oprkind == 'b' && list_length(node->args) == 2));
 
+	cur_opname = NameStr(form->oprname);
+	/* If opname is '/' check all type of operands recursively */
+	if (form->oprnamespace == PG_CATALOG_NAMESPACE && strcmp(cur_opname, "/") == 0)
+		is_convert = mysql_deparse_op_divide((Expr *)node, context);
+
 	/* Always parenthesize the expression. */
 	appendStringInfoChar(buf, '(');
 
@@ -1058,8 +1174,14 @@ mysql_deparse_op_expr(OpExpr *node, deparse_expr_cxt *context)
 		appendStringInfoChar(buf, ' ');
 	}
 
-	/* Deparse operator name. */
-	mysql_deparse_operator_name(buf, form);
+	/*
+	 * Deparse operator name.
+	 * If all operands are non floating point type, change '/' to 'DIV'.
+	 */
+	if (is_convert)
+		appendStringInfoString(buf, "DIV");
+	else
+		mysql_deparse_operator_name(buf, form);
 
 	/* Deparse right operand. */
 	if (oprkind == 'l' || oprkind == 'b')
