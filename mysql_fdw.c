@@ -249,6 +249,7 @@ mysql_load_library(void)
 	_mysql_get_host_info = dlsym(mysql_dll_handle, "mysql_get_host_info");
 	_mysql_get_server_info = dlsym(mysql_dll_handle, "mysql_get_server_info");
 	_mysql_get_proto_info = dlsym(mysql_dll_handle, "mysql_get_proto_info");
+	_mysql_warning_count = dlsym(mysql_dll_handle, "mysql_warning_count");
 	
 	if (_mysql_stmt_bind_param == NULL ||
 		_mysql_stmt_bind_result == NULL ||
@@ -279,7 +280,8 @@ mysql_load_library(void)
 		_mysql_num_rows == NULL ||
 		_mysql_get_host_info == NULL ||
 		_mysql_get_server_info == NULL ||
-		_mysql_get_proto_info == NULL)
+		_mysql_get_proto_info == NULL ||
+		_mysql_warning_count == NULL)
 			return false;
 	return true;
 }
@@ -457,7 +459,8 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 		_mysql_query(festate->conn, timeout);
 	}
 
-	_mysql_query(festate->conn, "SET sql_mode='ANSI_QUOTES'");
+	/* Change sql_mode to TRADITIONAL to catch warning "Division by 0" */
+	_mysql_query(festate->conn, "SET sql_mode='TRADITIONAL'");
 
 
 	/* Initialize the MySQL statement */
@@ -635,6 +638,71 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 							errmsg("failed to execute the MySQL query: \n%s", err)));
 			}
 			break;
+		}
+	}
+	else
+	{
+		/* Check the results of query has warning or not */
+		if(_mysql_warning_count(festate->conn) > 0)
+		{
+			MYSQL_RES	*result = NULL;
+
+			if (_mysql_query(festate->conn, "SHOW WARNINGS"))
+			{
+				switch(_mysql_errno(festate->conn))
+				{
+					case CR_NO_ERROR:
+						break;
+
+					case CR_OUT_OF_MEMORY:
+					case CR_SERVER_GONE_ERROR:
+					case CR_SERVER_LOST:
+					case CR_UNKNOWN_ERROR:
+					{
+						char *err = pstrdup(_mysql_error(festate->conn));
+						mysql_rel_connection(festate->conn);
+						ereport(ERROR,
+									(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+									errmsg("failed to execute the MySQL query: \n%s", err)));
+					}
+					break;
+					case CR_COMMANDS_OUT_OF_SYNC:
+					default:
+					{
+						char *err = pstrdup(_mysql_error(festate->conn));
+						ereport(ERROR,
+									(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+									errmsg("failed to execute the MySQL query: \n%s", err)));
+					}
+				}
+			}
+			result = _mysql_store_result(festate->conn);
+			if (result)
+			{
+				/*
+				 * MySQL provide numbers of rows per table invole in
+				 * the statment, but we don't have problem with it
+				 * because we are sending separate query per table
+				 * in FDW.
+				 */
+				MYSQL_ROW		row;
+				unsigned int	num_fields;
+				unsigned int	i;
+
+				num_fields = _mysql_num_fields(result);
+				while ((row = _mysql_fetch_row(result)))
+				{
+					for(i = 0; i < num_fields; i++)
+					{
+						/* Check warning of query */
+						if (strcmp(row[i], "Division by 0") == 0)
+							ereport(ERROR,
+										(errcode(ERRCODE_DIVISION_BY_ZERO),
+										errmsg("division by zero")));
+					}
+				}
+				_mysql_free_result(result);
+			}
 		}
 	}
 }
