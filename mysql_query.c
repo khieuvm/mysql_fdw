@@ -104,8 +104,8 @@ mysql_convert_to_pg(Oid pgtyp, int pgtypmod, mysql_column *column)
 			return PointerGetDatum(column->value);
 
 		case BITOID:
-			sprintf(str, "%d", dec_bin(*((int*)column->value)));
-			valueDatum = CStringGetDatum((char*)str);
+			sprintf(str, "%d", dec_bin(*((int *) column->value)));
+			valueDatum = CStringGetDatum((char *) str);
 			break;
 		default:
 			valueDatum = CStringGetDatum((char *) column->value);
@@ -264,8 +264,7 @@ mysql_bind_sql_var(Oid type, int attnum, Datum value, MYSQL_BIND *binds,
 
 				binds[attnum].buffer = bufptr;
 			}
-
-
+			break;
 		/* TODO: We may have to add more type of array */
 		case INT2ARRAYOID:
 		case BPCHAROID:
@@ -378,12 +377,7 @@ mysql_bind_sql_var(Oid type, int attnum, Datum value, MYSQL_BIND *binds,
 				binds[attnum].buffer = bufptr;
 				binds[attnum].buffer_length = len;
 			}
-			bufptr = palloc0(len);
-			memcpy(bufptr, (char*)dat, len);
-			binds[attnum].buffer = bufptr;
-			binds[attnum].buffer_length = len;
 			break;
-		}
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_INVALID_DATA_TYPE),

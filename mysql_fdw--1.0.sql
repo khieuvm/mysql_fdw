@@ -32,4 +32,3 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 CREATE FOREIGN DATA WRAPPER mysql_fdw
   HANDLER mysql_fdw_handler
   VALIDATOR mysql_fdw_validator;
-

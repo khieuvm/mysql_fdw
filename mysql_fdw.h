@@ -74,6 +74,7 @@
 #define mysql_errno (*_mysql_errno)
 #define mysql_num_fields (*_mysql_num_fields)
 #define mysql_num_rows (*_mysql_num_rows)
+#define mysql_warning_count (*_mysql_warning_count)
 
 /*
  * Options structure to store the MySQL
@@ -161,66 +162,71 @@ typedef struct MySQLColumn
 	int			atttype;		/* Attribute type */
 } MySQLColumn;
 
-extern bool mysql_is_foreign_expr(PlannerInfo *root,
-                                RelOptInfo *baserel,
-                                Expr *expr);
+extern bool mysql_is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel,
+							Expr *expr);
 
+int ((mysql_options) (MYSQL *mysql, enum mysql_option option,
+					  const void *arg));
+int ((mysql_stmt_prepare) (MYSQL_STMT *stmt, const char *query,
+						   unsigned long length));
+int ((mysql_stmt_execute) (MYSQL_STMT *stmt));
+int ((mysql_stmt_fetch) (MYSQL_STMT *stmt));
+int ((mysql_query) (MYSQL *mysql, const char *q));
+bool ((mysql_stmt_attr_set) (MYSQL_STMT *stmt,
+							 enum enum_stmt_attr_type attr_type,
+							 const void *attr));
+bool ((mysql_stmt_close) (MYSQL_STMT *stmt));
+bool ((mysql_stmt_reset) (MYSQL_STMT *stmt));
+bool ((mysql_free_result) (MYSQL_RES *result));
+bool ((mysql_stmt_bind_param) (MYSQL_STMT *stmt, MYSQL_BIND *bnd));
+bool ((mysql_stmt_bind_result) (MYSQL_STMT *stmt, MYSQL_BIND *bnd));
 
-int ((*_mysql_options)(MYSQL *mysql,enum mysql_option option, const void *arg));
-int ((*_mysql_stmt_prepare)(MYSQL_STMT *stmt, const char *query, unsigned long length));
-int ((*_mysql_stmt_execute)(MYSQL_STMT *stmt));
-int ((*_mysql_stmt_fetch)(MYSQL_STMT *stmt));
-int ((*_mysql_query)(MYSQL *mysql, const char *q));
-bool ((*_mysql_stmt_attr_set)(MYSQL_STMT *stmt, enum enum_stmt_attr_type attr_type, const void *attr));
-bool ((*_mysql_stmt_close)(MYSQL_STMT * stmt));
-bool ((*_mysql_stmt_reset)(MYSQL_STMT * stmt));
-bool ((*_mysql_free_result)(MYSQL_RES *result));
-bool ((*_mysql_stmt_bind_param)(MYSQL_STMT *stmt, MYSQL_BIND * bnd));
-bool ((*_mysql_stmt_bind_result)(MYSQL_STMT *stmt, MYSQL_BIND * bnd));
+MYSQL_STMT *((mysql_stmt_init) (MYSQL *mysql));
+MYSQL_RES *((mysql_stmt_result_metadata) (MYSQL_STMT *stmt));
+int ((mysql_stmt_store_result) (MYSQL *mysql));
+MYSQL_ROW((mysql_fetch_row) (MYSQL_RES *result));
+MYSQL_FIELD *((mysql_fetch_field) (MYSQL_RES *result));
+MYSQL_FIELD *((mysql_fetch_fields) (MYSQL_RES *result));
+const char *((mysql_error) (MYSQL *mysql));
+void ((mysql_close) (MYSQL *sock));
+MYSQL_RES *((mysql_store_result) (MYSQL *mysql));
+MYSQL *((mysql_init) (MYSQL *mysql));
+bool ((mysql_ssl_set) (MYSQL *mysql, const char *key, const char *cert,
+					   const char *ca, const char *capath,
+					   const char *cipher));
+MYSQL *((mysql_real_connect) (MYSQL *mysql, const char *host, const char *user,
+							  const char *passwd, const char *db,
+							  unsigned int port, const char *unix_socket,
+							  unsigned long clientflag));
 
-MYSQL_STMT	*((*_mysql_stmt_init)(MYSQL *mysql));
-MYSQL_RES	*((*_mysql_stmt_result_metadata)(MYSQL_STMT *stmt));
-int ((*_mysql_stmt_store_result)(MYSQL *mysql));
-MYSQL_ROW	((*_mysql_fetch_row)(MYSQL_RES *result));
-MYSQL_FIELD	*((*_mysql_fetch_field)(MYSQL_RES *result));
-MYSQL_FIELD	*((*_mysql_fetch_fields)(MYSQL_RES *result));
-const char	*((*_mysql_error)(MYSQL *mysql));
-void	((*_mysql_close)(MYSQL *sock));
-MYSQL_RES* ((*_mysql_store_result)(MYSQL *mysql));
+const char *((mysql_get_host_info) (MYSQL *mysql));
+const char *((mysql_get_server_info) (MYSQL *mysql));
+int ((mysql_get_proto_info) (MYSQL *mysql));
 
-MYSQL	*((*_mysql_init)(MYSQL *mysql));
-bool ((*_mysql_ssl_set)(MYSQL *mysql, const char *key, const char *cert, const char *ca, const char *capath, const char *cipher));
-MYSQL	*((*_mysql_real_connect)(MYSQL *mysql,
-								const char *host,
-								const char *user,
-								const char *passwd,
-								const char *db,
-								unsigned int port,
-								const char *unix_socket,
-								unsigned long clientflag));
-
-const char *((*_mysql_get_host_info) (MYSQL *mysql));
-const char *((*_mysql_get_server_info) (MYSQL *mysql));
-int ((*_mysql_get_proto_info) (MYSQL *mysql));
-
-unsigned int ((*_mysql_stmt_errno)(MYSQL_STMT *stmt));
-unsigned int ((*_mysql_errno)(MYSQL *mysql));
-unsigned int ((*_mysql_num_fields)(MYSQL_RES *result));
-unsigned int ((*_mysql_num_rows)(MYSQL_RES *result));
-unsigned int ((*_mysql_warning_count)(MYSQL *mysql));
-
+unsigned int ((mysql_stmt_errno) (MYSQL_STMT *stmt));
+unsigned int ((mysql_errno) (MYSQL *mysql));
+unsigned int ((mysql_num_fields) (MYSQL_RES *result));
+unsigned int ((mysql_num_rows) (MYSQL_RES *result));
+unsigned int ((mysql_warning_count)(MYSQL *mysql));
 
 /* option.c headers */
 extern bool mysql_is_valid_option(const char *option, Oid context);
 extern mysql_opt *mysql_get_options(Oid foreigntableid);
 
 /* depare.c headers */
-extern void mysql_deparse_select(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel,
-							 Bitmapset *attrs_used, char *svr_table, List **retrieved_attrs, List *tlist);
-extern void mysql_deparse_insert(StringInfo buf, PlannerInfo *root, Index rtindex, Relation rel, List *targetAttrs);
-extern void mysql_deparse_update(StringInfo buf, PlannerInfo *root, Index rtindex, Relation rel, List *targetAttrs, char *attname);
-extern void mysql_deparse_delete(StringInfo buf, PlannerInfo *root, Index rtindex, Relation rel, char *name);
-extern void mysql_append_where_clause(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel, List *exprs,
+extern void mysql_deparse_select(StringInfo buf, PlannerInfo *root,
+								 RelOptInfo *baserel, Bitmapset *attrs_used,
+								 char *svr_table, List **retrieved_attrs, List *tlist);
+extern void mysql_deparse_insert(StringInfo buf, PlannerInfo *root,
+								 Index rtindex, Relation rel,
+								 List *targetAttrs);
+extern void mysql_deparse_update(StringInfo buf, PlannerInfo *root,
+								 Index rtindex, Relation rel,
+								 List *targetAttrs, char *attname);
+extern void mysql_deparse_delete(StringInfo buf, PlannerInfo *root,
+								 Index rtindex, Relation rel, char *name);
+extern void mysql_append_where_clause(StringInfo buf, PlannerInfo *root,
+									  RelOptInfo *baserel, List *exprs,
 									  bool is_first, List **params);
 extern void mysql_deparse_analyze(StringInfo buf, char *dbname, char *relname);
 

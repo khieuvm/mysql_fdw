@@ -115,9 +115,13 @@ static void mysql_print_remote_param(int paramindex, Oid paramtype,
 static void mysql_print_remote_placeholder(Oid paramtype, int32 paramtypmod,
 										   deparse_expr_cxt *context);
 static void mysql_deparse_relation(StringInfo buf, Relation rel);
-static void mysql_deparse_target_list(StringInfo buf, PlannerInfo *root, Index rtindex, Relation rel,
-					Bitmapset *attrs_used, List **retrieved_attrs, List *tlist, RelOptInfo *baserel);
-static void mysql_deparse_column_ref(StringInfo buf, int varno, int varattno, PlannerInfo *root);
+static void mysql_deparse_target_list(StringInfo buf, PlannerInfo *root,
+									  Index rtindex, Relation rel,
+									  Bitmapset *attrs_used,
+									  List **retrieved_attrs,
+									  List *tlist, RelOptInfo *baserel);
+static void mysql_deparse_column_ref(StringInfo buf, int varno, int varattno,
+									 PlannerInfo *root);
 static bool mysql_deparse_op_divide(Expr *node, deparse_expr_cxt *context);
 
 /*
@@ -196,13 +200,9 @@ mysql_quote_identifier(const char *str, char quotechar)
  * Deparse SELECT statement
  */
 void
-mysql_deparse_select(StringInfo buf,
-				 PlannerInfo *root,
-				 RelOptInfo *baserel,
-				 Bitmapset *attrs_used,
-				 char *svr_table,
-				 List **retrieved_attrs,
-				 List *tlist)
+mysql_deparse_select(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel,
+					 Bitmapset *attrs_used, char *svr_table,
+					 List **retrieved_attrs, List *tlist)
 {
 	RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
 	Relation	rel;
@@ -218,7 +218,7 @@ mysql_deparse_select(StringInfo buf,
 #endif
 
 	appendStringInfoString(buf, "SELECT ");
-	mysql_deparse_target_list(buf, root, baserel->relid, rel, attrs_used, 
+	mysql_deparse_target_list(buf, root, baserel->relid, rel, attrs_used,
 							  retrieved_attrs, tlist, baserel);
 
 	/*
@@ -304,26 +304,24 @@ mysql_deparse_analyze(StringInfo sql, char *dbname, char *relname)
  * This is used for both SELECT and RETURNING targetlists.
  */
 static void
-mysql_deparse_target_list(StringInfo buf,
-				  PlannerInfo *root,
-				  Index rtindex,
-				  Relation rel,
-				  Bitmapset *attrs_used,
-				  List **retrieved_attrs,
-				  List *tlist,
-				  RelOptInfo *baserel)
+mysql_deparse_target_list(StringInfo buf, PlannerInfo *root, Index rtindex,
+						  Relation rel, Bitmapset *attrs_used,
+						  List **retrieved_attrs,
+						  List *tlist,
+						  RelOptInfo *baserel)
 {
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	bool		have_wholerow;
 	bool		first;
 	int			i;
-
 	ListCell *cell;
+
 	/* If there's a whole-row reference, we'll need all the columns. */
 	have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
 								  attrs_used);
+
 	first = true;
-	
+
 	if (retrieved_attrs)
 	{
 		/* Not pushdown target list */
@@ -371,6 +369,7 @@ mysql_deparse_target_list(StringInfo buf,
 			deparseExpr(expr, &context);
 		}
 	}
+
 	/* Don't generate bad syntax if no undropped columns */
 	if (first)
 		appendStringInfoString(buf, "NULL");
@@ -1336,7 +1335,7 @@ mysql_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node,
 		appendStringInfoChar(buf, ',');
 	}
 
-	switch (nodeTag((Node*)arg2))
+	switch (nodeTag((Node *) arg2))
 	{
 		case T_Const:
 			{

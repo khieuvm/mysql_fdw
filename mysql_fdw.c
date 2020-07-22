@@ -244,7 +244,7 @@ mysql_load_library(void)
 	_mysql_get_server_info = dlsym(mysql_dll_handle, "mysql_get_server_info");
 	_mysql_get_proto_info = dlsym(mysql_dll_handle, "mysql_get_proto_info");
 	_mysql_warning_count = dlsym(mysql_dll_handle, "mysql_warning_count");
-	
+
 	if (_mysql_stmt_bind_param == NULL ||
 		_mysql_stmt_bind_result == NULL ||
 		_mysql_stmt_init == NULL ||
@@ -276,7 +276,8 @@ mysql_load_library(void)
 		_mysql_get_server_info == NULL ||
 		_mysql_get_proto_info == NULL ||
 		_mysql_warning_count == NULL)
-			return false;
+		return false;
+
 	return true;
 }
 
@@ -431,7 +432,6 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	/* Stash away the state info we have already */
 	festate->query = strVal(list_nth(fsplan->fdw_private, 0));
 	festate->retrieved_attrs = list_nth(fsplan->fdw_private, 1);
-
 	festate->conn = conn;
 	festate->cursor_exists = false;
 
@@ -463,7 +463,6 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 
 	/* Change sql_mode to TRADITIONAL to catch warning "Division by 0" */
 	_mysql_query(festate->conn, "SET sql_mode='TRADITIONAL'");
-
 
 	/* Initialize the MySQL statement */
 	festate->stmt = mysql_stmt_init(festate->conn);
@@ -525,14 +524,11 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 
 	festate->table->mysql_fields = mysql_fetch_fields(festate->table->mysql_res);
 
-	atindex = 0;
-	foreach (lc, festate->retrieved_attrs)
+	foreach(lc, festate->retrieved_attrs)
 	{
-		Oid pgtype;
-		int32 pgtypmod;
-		int attnum = lfirst_int(lc) - 1;
-		pgtype = TupleDescAttr(tupleDescriptor, attnum)->atttypid;
-		pgtypmod = TupleDescAttr(tupleDescriptor, attnum)->atttypmod;
+		int			attnum = lfirst_int(lc) - 1;
+		Oid			pgtype = TupleDescAttr(tupleDescriptor, attnum)->atttypid;
+		int32		pgtypmod = TupleDescAttr(tupleDescriptor, attnum)->atttypmod;
 
 		if (TupleDescAttr(tupleDescriptor, attnum)->attisdropped)
 			continue;
@@ -566,7 +562,7 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 				{
 					char	   *err = pstrdup(_mysql_error(festate->conn));
 
-					mysql_rel_connection(festate->conn);
+					mysql_release_connection(festate->conn);
 					ereport(ERROR,
 							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 							 errmsg("failed to execute the MySQL query: \n%s", err)));
@@ -605,7 +601,7 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 					case CR_UNKNOWN_ERROR:
 					{
 						char *err = pstrdup(_mysql_error(festate->conn));
-						mysql_rel_connection(festate->conn);
+						mysql_release_connection(festate->conn);
 						ereport(ERROR,
 									(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 									errmsg("failed to execute the MySQL query: \n%s", err)));
@@ -687,6 +683,7 @@ mysqlIterateForeignScan(ForeignScanState *node)
 				tupleSlot->tts_values[attnum] = mysql_convert_to_pg(pgtype,
 																	pgtypmod,
 																	&festate->table->column[attid]);
+
 			attid++;
 		}
 
@@ -874,8 +871,8 @@ mysqlGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 		initStringInfo(&sql);
 		appendStringInfo(&sql, "EXPLAIN ");
 
-		mysql_deparse_select(&sql, root, baserel, fpinfo->attrs_used, options->svr_table, 
-							 &retrieved_attrs, NULL);
+		mysql_deparse_select(&sql, root, baserel, fpinfo->attrs_used,
+							 options->svr_table, &retrieved_attrs, NULL);
 		if (fpinfo->remote_conds)
 			mysql_append_where_clause(&sql, root, baserel,
 									  fpinfo->remote_conds, true,
@@ -1110,7 +1107,7 @@ mysqlGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel,
 		}
 		else if (list_member_ptr(fpinfo->local_conds, rinfo))
 			local_exprs = lappend(local_exprs, rinfo->clause);
-		else if (mysql_is_foreign_expr(root, baserel, rinfo->clause))
+		else if (mysql_is_foreign_expr(root, foreignrel, rinfo->clause))
 		{
 			remote_conds = lappend(remote_conds, rinfo);
 			remote_exprs = lappend(remote_exprs, rinfo->clause);
@@ -1120,7 +1117,8 @@ mysqlGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel,
 	}
 
 	/* Cannot compile this code for plain PostgreSQL, which doesn't have is_tlist_pushdown member */
-	mysql_deparse_select(&sql, root, baserel, fpinfo->attrs_used, options->svr_table, &retrieved_attrs, NULL);
+	mysql_deparse_select(&sql, root, foreignrel, fpinfo->attrs_used,
+						 options->svr_table, &retrieved_attrs, NULL);
 
 	if (remote_conds)
 		mysql_append_where_clause(&sql, root, foreignrel, remote_conds,
@@ -1140,6 +1138,7 @@ mysqlGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel,
 	 */
 
 	fdw_private = list_make2(makeString(sql.data), retrieved_attrs);
+
 	/*
 	 * Create the ForeignScan node from target list, local filtering
 	 * expressions, remote parameter expressions, and FDW private information.
