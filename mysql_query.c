@@ -201,6 +201,7 @@ mysql_from_pgtyp(Oid type)
 		case VARCHAROID:
 		case TEXTOID:
 		case JSONOID:
+		case TEXTARRAYOID:
 			return MYSQL_TYPE_STRING;
 
 		case NAMEOID:
@@ -320,6 +321,7 @@ mysql_bind_sql_var(Oid type, int attnum, Datum value, MYSQL_BIND *binds, bool *i
 		case VARCHAROID:
 		case TEXTOID:
 		case JSONOID:
+		case TEXTARRAYOID:
 		{
 			char *outputString = NULL;
 			Oid outputFunctionId = InvalidOid;
