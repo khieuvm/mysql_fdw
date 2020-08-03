@@ -97,14 +97,15 @@ unsigned int ((mysql_stmt_errno) (MYSQL_STMT *stmt));
 unsigned int ((mysql_errno) (MYSQL *mysql));
 unsigned int ((mysql_num_fields) (MYSQL_RES *result));
 unsigned int ((mysql_num_rows) (MYSQL_RES *result));
+unsigned int ((mysql_warning_count)(MYSQL *mysql));
 
 #define DEFAULTE_NUM_ROWS    1000
 
 /*
  * In PG 9.5.1 the number will be 90501,
- * our version is 2.5.3 so number will be 20503
+ * our version is 2.5.4 so number will be 20504
  */
-#define CODE_VERSION   20503
+#define CODE_VERSION   20504
 
 typedef struct MySQLFdwRelationInfo
 {

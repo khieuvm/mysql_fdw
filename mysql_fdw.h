@@ -207,6 +207,7 @@ extern unsigned int ((mysql_stmt_errno) (MYSQL_STMT *stmt));
 extern unsigned int ((mysql_errno) (MYSQL *mysql));
 extern unsigned int ((mysql_num_fields) (MYSQL_RES *result));
 extern unsigned int ((mysql_num_rows) (MYSQL_RES *result));
+extern unsigned int ((mysql_warning_count)(MYSQL *mysql));
 
 /* option.c headers */
 extern bool mysql_is_valid_option(const char *option, Oid context);
