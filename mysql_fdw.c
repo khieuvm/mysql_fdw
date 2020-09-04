@@ -431,20 +431,21 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	TupleDesc	tupleDescriptor = tupleSlot->tts_tupleDescriptor;
 	MYSQL	   *conn;
 	RangeTblEntry *rte;
-	MySQLFdwExecState *festate = NULL;
-	EState            *estate = node->ss.ps.state;
-	ForeignScan       *fsplan = (ForeignScan *) node->ss.ps.plan;
-	mysql_opt         *options;
-	ListCell          *lc = NULL;
-	int               atindex = 0;
-	unsigned long     prefetch_rows = MYSQL_PREFETCH_ROWS;
-	unsigned long     type = (unsigned long) CURSOR_TYPE_READ_ONLY;
-	Oid               userid;
-	ForeignServer     *server;
-	UserMapping       *user;
-	ForeignTable      *table;
-	char              timeout[255];
-	int               numParams;
+	MySQLFdwExecState *festate;
+	EState	   *estate = node->ss.ps.state;
+	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+	mysql_opt  *options;
+	ListCell   *lc;
+	int			atindex = 0;
+	unsigned long prefetch_rows = MYSQL_PREFETCH_ROWS;
+	unsigned long type = (unsigned long) CURSOR_TYPE_READ_ONLY;
+	Oid			userid;
+	ForeignServer *server;
+	UserMapping *user;
+	ForeignTable *table;
+	char		timeout[255];
+	int			numParams;
+
 	/*
 	 * We'll save private state in node->fdw_state.
 	 */
@@ -506,7 +507,7 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	}
 
 	/* Change sql_mode to TRADITIONAL to catch warning "Division by 0" */
-	_mysql_query(festate->conn, "SET sql_mode='TRADITIONAL'");
+	mysql_query(festate->conn, "SET sql_mode='TRADITIONAL'");
 
 	/* Initialize the MySQL statement */
 	festate->stmt = mysql_stmt_init(festate->conn);
@@ -593,75 +594,22 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	 * Finally execute the query and result will be placed in the array we
 	 * already bind
 	 */
-	if (_mysql_stmt_execute(festate->stmt) != 0)
+	if (mysql_stmt_execute(festate->stmt) != 0)
 	{
-		switch (_mysql_stmt_errno(festate->stmt))
-		{
-			case CR_NO_ERROR:
-				break;
-
-			case CR_OUT_OF_MEMORY:
-			case CR_SERVER_GONE_ERROR:
-			case CR_SERVER_LOST:
-				{
-					char	   *err = pstrdup(_mysql_error(festate->conn));
-
-					mysql_release_connection(festate->conn);
-					ereport(ERROR,
-							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-							 errmsg("failed to execute the MySQL query: \n%s", err)));
-				}
-				break;
-			case CR_COMMANDS_OUT_OF_SYNC:
-			case CR_UNKNOWN_ERROR:
-			default:
-				{
-					char	   *err = pstrdup(_mysql_error(festate->conn));
-
-					ereport(ERROR,
-							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-							 errmsg("failed to execute the MySQL query: \n%s", err)));
-				}
-				break;
-		}
+		mysql_stmt_error_print(festate, "failed to execute the MySQL query");
 	}
 	else
 	{
 		/* Check the results of query has warning or not */
-		if(_mysql_warning_count(festate->conn) > 0)
+		if(mysql_warning_count(festate->conn) > 0)
 		{
 			MYSQL_RES	*result = NULL;
 
-			if (_mysql_query(festate->conn, "SHOW WARNINGS"))
+			if (mysql_query(festate->conn, "SHOW WARNINGS"))
 			{
-				switch(_mysql_errno(festate->conn))
-				{
-					case CR_NO_ERROR:
-						break;
-
-					case CR_OUT_OF_MEMORY:
-					case CR_SERVER_GONE_ERROR:
-					case CR_SERVER_LOST:
-					case CR_UNKNOWN_ERROR:
-					{
-						char *err = pstrdup(_mysql_error(festate->conn));
-						mysql_release_connection(festate->conn);
-						ereport(ERROR,
-									(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-									errmsg("failed to execute the MySQL query: \n%s", err)));
-					}
-					break;
-					case CR_COMMANDS_OUT_OF_SYNC:
-					default:
-					{
-						char *err = pstrdup(_mysql_error(festate->conn));
-						ereport(ERROR,
-									(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-									errmsg("failed to execute the MySQL query: \n%s", err)));
-					}
-				}
+				mysql_error_print(festate->conn);
 			}
-			result = _mysql_store_result(festate->conn);
+			result = mysql_store_result(festate->conn);
 			if (result)
 			{
 				/*
@@ -674,8 +622,8 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 				unsigned int	num_fields;
 				unsigned int	i;
 
-				num_fields = _mysql_num_fields(result);
-				while ((row = _mysql_fetch_row(result)))
+				num_fields = mysql_num_fields(result);
+				while ((row = mysql_fetch_row(result)))
 				{
 					for(i = 0; i < num_fields; i++)
 					{
@@ -686,7 +634,7 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 										errmsg("division by zero")));
 					}
 				}
-				_mysql_free_result(result);
+				mysql_free_result(result);
 			}
 		}
 	}
@@ -916,7 +864,8 @@ mysqlGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 		appendStringInfo(&sql, "EXPLAIN ");
 
 		mysql_deparse_select(&sql, root, baserel, fpinfo->attrs_used,
-							 options->svr_table, &retrieved_attrs, NULL);
+							 options->svr_table, &retrieved_attrs);
+
 		if (fpinfo->remote_conds)
 			mysql_append_where_clause(&sql, root, baserel,
 									  fpinfo->remote_conds, true,
@@ -1160,9 +1109,8 @@ mysqlGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel,
 			local_exprs = lappend(local_exprs, rinfo->clause);
 	}
 
-	/* Cannot compile this code for plain PostgreSQL, which doesn't have is_tlist_pushdown member */
 	mysql_deparse_select(&sql, root, foreignrel, fpinfo->attrs_used,
-						 options->svr_table, &retrieved_attrs, NULL);
+						 options->svr_table, &retrieved_attrs);
 
 	if (remote_conds)
 		mysql_append_where_clause(&sql, root, foreignrel, remote_conds,

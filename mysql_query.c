@@ -141,15 +141,13 @@ mysql_from_pgtyp(Oid type)
 			return MYSQL_TYPE_DOUBLE;
 		case BOOLOID:
 			return MYSQL_TYPE_LONG;
-
-
 		/* TODO: We may have to add more type of array */
 		case INT2ARRAYOID:
+		case TEXTARRAYOID:
 		case BPCHAROID:
 		case VARCHAROID:
 		case TEXTOID:
 		case JSONOID:
-		case TEXTARRAYOID:
 			return MYSQL_TYPE_STRING;
 		case NAMEOID:
 			return MYSQL_TYPE_STRING;
@@ -267,22 +265,23 @@ mysql_bind_sql_var(Oid type, int attnum, Datum value, MYSQL_BIND *binds,
 			break;
 		/* TODO: We may have to add more type of array */
 		case INT2ARRAYOID:
+		case TEXTARRAYOID:
 		case BPCHAROID:
 		case VARCHAROID:
 		case TEXTOID:
 		case JSONOID:
-		case TEXTARRAYOID:
-		{
-			char *outputString = NULL;
-			Oid outputFunctionId = InvalidOid;
-			bool typeVarLength = false;
-			getTypeOutputInfo(type, &outputFunctionId, &typeVarLength);
-			outputString = OidOutputFunctionCall(outputFunctionId, value);
+			{
+				char	   *outputString = NULL;
+				Oid			outputFunctionId = InvalidOid;
+				bool		typeVarLength = false;
 
-			binds[attnum].buffer = outputString;
-			binds[attnum].buffer_length = strlen(outputString);
+				getTypeOutputInfo(type, &outputFunctionId, &typeVarLength);
+				outputString = OidOutputFunctionCall(outputFunctionId, value);
+
+				binds[attnum].buffer = outputString;
+				binds[attnum].buffer_length = strlen(outputString);
+			}
 			break;
-		}
 		case NAMEOID:
 			{
 				char	   *outputString = NULL;
