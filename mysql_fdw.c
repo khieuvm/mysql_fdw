@@ -388,21 +388,21 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	EState            *estate = node->ss.ps.state;
 	ForeignScan       *fsplan = (ForeignScan *) node->ss.ps.plan;
 	mysql_opt         *options;
+	ListCell          *lc = NULL;
+	int               atindex = 0;
+	unsigned long     prefetch_rows = MYSQL_PREFETCH_ROWS;
+	unsigned long     type = (unsigned long) CURSOR_TYPE_READ_ONLY;
 	Oid               userid;
 	ForeignServer     *server;
 	UserMapping       *user;
 	ForeignTable      *table;
 	char              timeout[255];
 	int               numParams;
-
 	/*
 	 * We'll save private state in node->fdw_state.
 	 */
-	festate = (MySQLFdwExecState *) palloc(sizeof(MySQLFdwExecState));
+	festate = (MySQLFdwExecState *) palloc0(sizeof(MySQLFdwExecState));
 	node->fdw_state = (void *) festate;
-	festate->table = (mysql_table*) palloc0(sizeof(mysql_table));
-	festate->table->column = (mysql_column *) palloc0(sizeof(mysql_column) * tupleDescriptor->natts);
-	festate->table->_mysql_bind = (MYSQL_BIND*) palloc0(sizeof(MYSQL_BIND) * tupleDescriptor->natts);
 
 	/*
 	 * Identify which user to do the remote access as.  This should match what
@@ -503,6 +503,12 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 		}
 	}
 
+	/*
+	 * Do nothing in EXPLAIN (no ANALYZE) case.  node->fdw_state stays NULL.
+	 */
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
 	/* Prepare for output conversion of parameters used in remote query. */
 	numParams = list_length(fsplan->fdw_exprs);
 	festate->numParams = numParams;
@@ -515,7 +521,185 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 							 &festate->param_values,
 							 &festate->param_types);
 
-	festate->mysql_bind_buffer = (MYSQL_BIND*) palloc0(sizeof(MYSQL_BIND) * numParams);
+	/*
+	 * If this is the first call after Begin or ReScan, we need to create the
+	 * cursor on the remote side.
+	 */
+	if (!festate->cursor_exists)
+		create_cursor(node);
+
+    /* int column_count = mysql_num_fields(festate->meta); */
+
+	/* Set the statement as cursor type */
+	_mysql_stmt_attr_set(festate->stmt, STMT_ATTR_CURSOR_TYPE, (void*) &type);
+
+	/* Set the pre-fetch rows */
+	_mysql_stmt_attr_set(festate->stmt, STMT_ATTR_PREFETCH_ROWS, (void*) &prefetch_rows);
+
+	festate->table = (mysql_table*) palloc0(sizeof(mysql_table));
+	festate->table->column = (mysql_column *) palloc0(sizeof(mysql_column) * tupleDescriptor->natts);
+	festate->table->_mysql_bind = (MYSQL_BIND*) palloc0(sizeof(MYSQL_BIND) * tupleDescriptor->natts);
+
+	festate->table->_mysql_res = _mysql_stmt_result_metadata(festate->stmt);
+	if (NULL == festate->table->_mysql_res)
+	{
+			char *err = pstrdup(_mysql_error(festate->conn));
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("failed to retrieve query result set metadata: \n%s", err)));
+	}
+
+	festate->table->_mysql_fields = _mysql_fetch_fields(festate->table->_mysql_res);
+
+	atindex = 0;
+	foreach (lc, festate->retrieved_attrs)
+	{
+		Oid pgtype;
+		int32 pgtypmod;
+		int attnum = lfirst_int(lc) - 1;
+		pgtype = TupleDescAttr(tupleDescriptor, attnum)->atttypid;
+		pgtypmod = TupleDescAttr(tupleDescriptor, attnum)->atttypmod;
+
+		if (TupleDescAttr(tupleDescriptor, attnum)->attisdropped)
+			continue;
+
+		festate->table->column[atindex]._mysql_bind = &festate->table->_mysql_bind[atindex];
+
+		mysql_bind_result(pgtype, pgtypmod, &festate->table->_mysql_fields[atindex],
+							&festate->table->column[atindex]);
+		atindex++;
+	}
+
+	/* Bind the results pointers for the prepare statements */
+	if (_mysql_stmt_bind_result(festate->stmt, festate->table->_mysql_bind) != 0)
+	{
+		switch(_mysql_stmt_errno(festate->stmt))
+		{
+			case CR_NO_ERROR:
+				break;
+
+			case CR_OUT_OF_MEMORY:
+			case CR_SERVER_GONE_ERROR:
+			case CR_SERVER_LOST:
+			{
+				char *err = pstrdup(_mysql_error(festate->conn));
+				mysql_rel_connection(festate->conn);
+				ereport(ERROR,
+							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+							errmsg("failed to bind the MySQL query: \n%s", err)));
+			}
+			break;
+			case CR_COMMANDS_OUT_OF_SYNC:
+			case CR_UNKNOWN_ERROR:
+			default:
+			{
+				char *err = pstrdup(_mysql_error(festate->conn));
+				ereport(ERROR,
+							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+							errmsg("failed to bind the MySQL query: \n%s", err)));
+			}
+			break;
+		}
+	}
+	/*
+	 * Finally execute the query and result will be placed in the
+	 * array we already bind
+	 */
+	if (_mysql_stmt_execute(festate->stmt) != 0)
+	{
+		switch(_mysql_stmt_errno(festate->stmt))
+		{
+			case CR_NO_ERROR:
+				break;
+
+			case CR_OUT_OF_MEMORY:
+			case CR_SERVER_GONE_ERROR:
+			case CR_SERVER_LOST:
+			{
+				char *err = pstrdup(_mysql_error(festate->conn));
+				mysql_rel_connection(festate->conn);
+				ereport(ERROR,
+							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+							errmsg("failed to execute the MySQL query: \n%s", err)));
+			}
+			break;
+			case CR_COMMANDS_OUT_OF_SYNC:
+			case CR_UNKNOWN_ERROR:
+			default:
+			{
+				char *err = pstrdup(_mysql_error(festate->conn));
+				ereport(ERROR,
+							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+							errmsg("failed to execute the MySQL query: \n%s", err)));
+			}
+			break;
+		}
+	}
+	else
+	{
+		/* Check the results of query has warning or not */
+		if(_mysql_warning_count(festate->conn) > 0)
+		{
+			MYSQL_RES	*result = NULL;
+
+			if (_mysql_query(festate->conn, "SHOW WARNINGS"))
+			{
+				switch(_mysql_errno(festate->conn))
+				{
+					case CR_NO_ERROR:
+						break;
+
+					case CR_OUT_OF_MEMORY:
+					case CR_SERVER_GONE_ERROR:
+					case CR_SERVER_LOST:
+					case CR_UNKNOWN_ERROR:
+					{
+						char *err = pstrdup(_mysql_error(festate->conn));
+						mysql_rel_connection(festate->conn);
+						ereport(ERROR,
+									(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+									errmsg("failed to execute the MySQL query: \n%s", err)));
+					}
+					break;
+					case CR_COMMANDS_OUT_OF_SYNC:
+					default:
+					{
+						char *err = pstrdup(_mysql_error(festate->conn));
+						ereport(ERROR,
+									(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+									errmsg("failed to execute the MySQL query: \n%s", err)));
+					}
+				}
+			}
+			result = _mysql_store_result(festate->conn);
+			if (result)
+			{
+				/*
+				 * MySQL provide numbers of rows per table invole in
+				 * the statment, but we don't have problem with it
+				 * because we are sending separate query per table
+				 * in FDW.
+				 */
+				MYSQL_ROW		row;
+				unsigned int	num_fields;
+				unsigned int	i;
+
+				num_fields = _mysql_num_fields(result);
+				while ((row = _mysql_fetch_row(result)))
+				{
+					for(i = 0; i < num_fields; i++)
+					{
+						/* Check warning of query */
+						if (strcmp(row[i], "Division by 0") == 0)
+							ereport(ERROR,
+										(errcode(ERRCODE_DIVISION_BY_ZERO),
+										errmsg("division by zero")));
+					}
+				}
+				_mysql_free_result(result);
+			}
+		}
+	}
 }
 
 /*
@@ -531,13 +715,6 @@ mysqlIterateForeignScan(ForeignScanState *node)
 	int                 attid = 0;
 	ListCell            *lc = NULL;
 	int                 rc = 0;
-
-	/*
-	 * If this is the first call after Begin or ReScan, we need to create the
-	 * cursor on the remote side.
-	 */
-	if (!festate->cursor_exists)
-		create_cursor(node);
 
 	memset (tupleSlot->tts_values, 0, sizeof(Datum) * tupleDescriptor->natts);
 	memset (tupleSlot->tts_isnull, true, sizeof(bool) * tupleDescriptor->natts);
@@ -2115,12 +2292,7 @@ create_cursor(ForeignScanState *node)
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
 	int			numParams = festate->numParams;
 	const char **values = festate->param_values;
-	TupleTableSlot    *tupleSlot = node->ss.ss_ScanTupleSlot;
-	TupleDesc         tupleDescriptor = tupleSlot->tts_tupleDescriptor;
-	ListCell          *lc = NULL;
-	int               atindex = 0;
-	unsigned long     prefetch_rows = MYSQL_PREFETCH_ROWS;
-	unsigned long     type = (unsigned long) CURSOR_TYPE_READ_ONLY;
+	MYSQL_BIND *mysql_bind_buffer = NULL;
 
 	/*
 	 * Construct array of query parameter values in text format.  We do the
@@ -2133,188 +2305,21 @@ create_cursor(ForeignScanState *node)
 
 		oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 
+		mysql_bind_buffer = (MYSQL_BIND*) palloc0(sizeof(MYSQL_BIND) * numParams);
+
 		process_query_params(econtext,
 							 festate->param_flinfo,
 							 festate->param_exprs,
 							 values,
-							 &festate->mysql_bind_buffer,
+							 &mysql_bind_buffer,
 							 festate->param_types);
 
-		_mysql_stmt_bind_param(festate->stmt, festate->mysql_bind_buffer);
+		_mysql_stmt_bind_param(festate->stmt, mysql_bind_buffer);
+
+		/* Mark the cursor as created, and show no tuples have been retrieved */
+		festate->cursor_exists = true;
 
 		MemoryContextSwitchTo(oldcontext);
-	}
-
-	/* Mark the cursor as created, and show no tuples have been retrieved */
-	festate->cursor_exists = true;
-
-	/* int column_count = mysql_num_fields(festate->meta); */
-
-	/* Set the statement as cursor type */
-	_mysql_stmt_attr_set(festate->stmt, STMT_ATTR_CURSOR_TYPE, (void*) &type);
-
-	/* Set the pre-fetch rows */
-	_mysql_stmt_attr_set(festate->stmt, STMT_ATTR_PREFETCH_ROWS, (void*) &prefetch_rows);
-
-	festate->table->_mysql_res = _mysql_stmt_result_metadata(festate->stmt);
-	if (NULL == festate->table->_mysql_res)
-	{
-			char *err = pstrdup(_mysql_error(festate->conn));
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-					 errmsg("failed to retrieve query result set metadata: \n%s", err)));
-	}
-
-	festate->table->_mysql_fields = _mysql_fetch_fields(festate->table->_mysql_res);
-
-	atindex = 0;
-	foreach (lc, festate->retrieved_attrs)
-	{
-		Oid pgtype;
-		int32 pgtypmod;
-		int attnum = lfirst_int(lc) - 1;
-		pgtype = TupleDescAttr(tupleDescriptor, attnum)->atttypid;
-		pgtypmod = TupleDescAttr(tupleDescriptor, attnum)->atttypmod;
-
-		if (TupleDescAttr(tupleDescriptor, attnum)->attisdropped)
-			continue;
-
-		festate->table->column[atindex]._mysql_bind = &festate->table->_mysql_bind[atindex];
-
-		mysql_bind_result(pgtype, pgtypmod, &festate->table->_mysql_fields[atindex],
-							&festate->table->column[atindex]);
-		atindex++;
-	}
-
-	/* Bind the results pointers for the prepare statements */
-	if (_mysql_stmt_bind_result(festate->stmt, festate->table->_mysql_bind) != 0)
-	{
-		switch(_mysql_stmt_errno(festate->stmt))
-		{
-			case CR_NO_ERROR:
-				break;
-
-			case CR_OUT_OF_MEMORY:
-			case CR_SERVER_GONE_ERROR:
-			case CR_SERVER_LOST:
-			{
-				char *err = pstrdup(_mysql_error(festate->conn));
-				mysql_rel_connection(festate->conn);
-				ereport(ERROR,
-							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-							errmsg("failed to bind the MySQL query: \n%s", err)));
-			}
-			break;
-			case CR_COMMANDS_OUT_OF_SYNC:
-			case CR_UNKNOWN_ERROR:
-			default:
-			{
-				char *err = pstrdup(_mysql_error(festate->conn));
-				ereport(ERROR,
-							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-							errmsg("failed to bind the MySQL query: \n%s", err)));
-			}
-			break;
-		}
-	}
-	/*
-	 * Finally execute the query and result will be placed in the
-	 * array we already bind
-	 */
-	if (_mysql_stmt_execute(festate->stmt) != 0)
-	{
-		switch(_mysql_stmt_errno(festate->stmt))
-		{
-			case CR_NO_ERROR:
-				break;
-
-			case CR_OUT_OF_MEMORY:
-			case CR_SERVER_GONE_ERROR:
-			case CR_SERVER_LOST:
-			{
-				char *err = pstrdup(_mysql_error(festate->conn));
-				mysql_rel_connection(festate->conn);
-				ereport(ERROR,
-							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-							errmsg("failed to execute the MySQL query: \n%s", err)));
-			}
-			break;
-			case CR_COMMANDS_OUT_OF_SYNC:
-			case CR_UNKNOWN_ERROR:
-			default:
-			{
-				char *err = pstrdup(_mysql_error(festate->conn));
-				ereport(ERROR,
-							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-							errmsg("failed to execute the MySQL query: \n%s", err)));
-			}
-			break;
-		}
-	}
-	else
-	{
-		/* Check the results of query has warning or not */
-		if(_mysql_warning_count(festate->conn) > 0)
-		{
-			MYSQL_RES	*result = NULL;
-
-			if (_mysql_query(festate->conn, "SHOW WARNINGS"))
-			{
-				switch(_mysql_errno(festate->conn))
-				{
-					case CR_NO_ERROR:
-						break;
-
-					case CR_OUT_OF_MEMORY:
-					case CR_SERVER_GONE_ERROR:
-					case CR_SERVER_LOST:
-					case CR_UNKNOWN_ERROR:
-					{
-						char *err = pstrdup(_mysql_error(festate->conn));
-						mysql_rel_connection(festate->conn);
-						ereport(ERROR,
-									(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-									errmsg("failed to execute the MySQL query: \n%s", err)));
-					}
-					break;
-					case CR_COMMANDS_OUT_OF_SYNC:
-					default:
-					{
-						char *err = pstrdup(_mysql_error(festate->conn));
-						ereport(ERROR,
-									(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-									errmsg("failed to execute the MySQL query: \n%s", err)));
-					}
-				}
-			}
-			result = _mysql_store_result(festate->conn);
-			if (result)
-			{
-				/*
-				 * MySQL provide numbers of rows per table invole in
-				 * the statment, but we don't have problem with it
-				 * because we are sending separate query per table
-				 * in FDW.
-				 */
-				MYSQL_ROW		row;
-				unsigned int	num_fields;
-				unsigned int	i;
-
-				num_fields = _mysql_num_fields(result);
-				while ((row = _mysql_fetch_row(result)))
-				{
-					for(i = 0; i < num_fields; i++)
-					{
-						/* Check warning of query */
-						if (strcmp(row[i], "Division by 0") == 0)
-							ereport(ERROR,
-										(errcode(ERRCODE_DIVISION_BY_ZERO),
-										errmsg("division by zero")));
-					}
-				}
-				_mysql_free_result(result);
-			}
-		}
 	}
 }
 

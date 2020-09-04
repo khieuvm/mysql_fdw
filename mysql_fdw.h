@@ -109,9 +109,6 @@ typedef struct MySQLFdwExecState
 	const char	**param_values;	    /* textual values of query parameters */
 	Oid		*param_types;	    /* type of query parameters */
 
-	MYSQL_BIND		*mysql_bind_buffer;	/* Bind the values provided as DatumBind the values
-										 * and nulls to modify the target table  */
-
 	int             p_nums;             /* number of parameters to transmit */
 	FmgrInfo        *p_flinfo;          /* output conversion functions for them */
 
