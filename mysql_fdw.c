@@ -211,7 +211,7 @@ static void process_query_params(ExprContext *econtext,
 								 MYSQL_BIND **mysql_bind_buf,
 								 Oid *param_types);
 
-static void create_cursor(ForeignScanState *node);
+static void bind_stmt_params_and_exec(ForeignScanState *node);
 
 void *mysql_dll_handle = NULL;
 static int wait_timeout = WAIT_TIMEOUT;
@@ -485,7 +485,7 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->query = strVal(list_nth(fsplan->fdw_private, 0));
 	festate->retrieved_attrs = list_nth(fsplan->fdw_private, 1);
 	festate->conn = conn;
-	festate->cursor_exists = false;
+	festate->query_executed = false;
 
 #if PG_VERSION_NUM >= 110000
 	festate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
@@ -547,13 +547,6 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 							 &festate->param_values,
 							 &festate->param_types);
 
-	/*
-	 * If this is the first call after Begin or ReScan, we need to create the
-	 * cursor on the remote side.
-	 */
-	if (!festate->cursor_exists)
-		create_cursor(node);
-
 	/* int column_count = mysql_num_fields(festate->meta); */
 
 	/* Set the statement as cursor type */
@@ -596,55 +589,6 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	/* Bind the results pointers for the prepare statements */
 	if (mysql_stmt_bind_result(festate->stmt, festate->table->mysql_bind) != 0)
 		mysql_stmt_error_print(festate, "failed to bind the MySQL query");
-
-	/*
-	 * Finally execute the query and result will be placed in the array we
-	 * already bind
-	 */
-	if (mysql_stmt_execute(festate->stmt) != 0)
-	{
-		mysql_stmt_error_print(festate, "failed to execute the MySQL query");
-	}
-	else
-	{
-		/* Check the results of query has warning or not */
-		if(mysql_warning_count(festate->conn) > 0)
-		{
-			MYSQL_RES	*result = NULL;
-
-			if (mysql_query(festate->conn, "SHOW WARNINGS"))
-			{
-				mysql_error_print(festate->conn);
-			}
-			result = mysql_store_result(festate->conn);
-			if (result)
-			{
-				/*
-				 * MySQL provide numbers of rows per table invole in
-				 * the statment, but we don't have problem with it
-				 * because we are sending separate query per table
-				 * in FDW.
-				 */
-				MYSQL_ROW		row;
-				unsigned int	num_fields;
-				unsigned int	i;
-
-				num_fields = mysql_num_fields(result);
-				while ((row = mysql_fetch_row(result)))
-				{
-					for(i = 0; i < num_fields; i++)
-					{
-						/* Check warning of query */
-						if (strcmp(row[i], "Division by 0") == 0)
-							ereport(ERROR,
-										(errcode(ERRCODE_DIVISION_BY_ZERO),
-										errmsg("division by zero")));
-					}
-				}
-				mysql_free_result(result);
-			}
-		}
-	}
 }
 
 /*
@@ -666,6 +610,13 @@ mysqlIterateForeignScan(ForeignScanState *node)
 	memset(tupleSlot->tts_isnull, true, sizeof(bool) * tupleDescriptor->natts);
 
 	ExecClearTuple(tupleSlot);
+
+	/*
+	 * If this is the first call after Begin or ReScan, we need to bind the
+	 * params and execute the query.
+	 */
+	if (!festate->query_executed)
+		bind_stmt_params_and_exec(node);
 
 	attid = 0;
 	rc = mysql_stmt_fetch(festate->stmt);
@@ -792,12 +743,12 @@ mysqlReScanForeignScan(ForeignScanState *node)
 {
 	MySQLFdwExecState *festate = (MySQLFdwExecState *) node->fdw_state;
 
-	/* If we haven't created the cursor yet, nothing to do. */
-	if (!festate->cursor_exists)
-		return;
+	/*
+	 * Set the query_executed flag to false so that the query will be executed
+	 * in mysqlIterateForeignScan().
+	 */
+	festate->query_executed = false;
 
-	if (mysql_stmt_execute(festate->stmt) != 0)
-		mysql_stmt_error_print(festate, "failed to execute the MySQL query");
 }
 
 /*
@@ -2000,10 +1951,11 @@ process_query_params(ExprContext *econtext,
 }
 
 /*
- * Create cursor for node's query with current parameter values.
+ * Process the query params and bind the same with the statement, if any.
+ * Also, execute the statement.
  */
 static void
-create_cursor(ForeignScanState *node)
+bind_stmt_params_and_exec(ForeignScanState *node)
 {
 	MySQLFdwExecState *festate = (MySQLFdwExecState *) node->fdw_state;
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
@@ -2033,11 +1985,72 @@ create_cursor(ForeignScanState *node)
 
 		mysql_stmt_bind_param(festate->stmt, mysql_bind_buffer);
 
-		/* Mark the cursor as created, and show no tuples have been retrieved */
-		festate->cursor_exists = true;
-
 		MemoryContextSwitchTo(oldcontext);
 	}
+
+	/*
+	 * Finally, execute the query. The result will be placed in the array we
+	 * already bind.
+	 */
+	if (mysql_stmt_execute(festate->stmt) != 0)
+	{
+		mysql_stmt_error_print(festate, "failed to execute the MySQL query");
+	}
+	else
+	{
+		/*
+		 * Finally execute the query and result will be placed in the array we
+		 * already bind
+		 */
+		if (mysql_stmt_execute(festate->stmt) != 0)
+		{
+			mysql_stmt_error_print(festate, "failed to execute the MySQL query");
+		}
+		else
+		{
+			/* Check the results of query has warning or not */
+			if(mysql_warning_count(festate->conn) > 0)
+			{
+				MYSQL_RES	*result = NULL;
+
+				if (mysql_query(festate->conn, "SHOW WARNINGS"))
+				{
+					mysql_error_print(festate->conn);
+				}
+				result = mysql_store_result(festate->conn);
+				if (result)
+				{
+					/*
+					* MySQL provide numbers of rows per table invole in
+					* the statment, but we don't have problem with it
+					* because we are sending separate query per table
+					* in FDW.
+					*/
+					MYSQL_ROW		row;
+					unsigned int	num_fields;
+					unsigned int	i;
+
+					num_fields = mysql_num_fields(result);
+					while ((row = mysql_fetch_row(result)))
+					{
+						for(i = 0; i < num_fields; i++)
+						{
+							/* Check warning of query */
+							if (strcmp(row[i], "Division by 0") == 0)
+								ereport(ERROR,
+											(errcode(ERRCODE_DIVISION_BY_ZERO),
+											errmsg("division by zero")));
+						}
+					}
+					mysql_free_result(result);
+				}
+			}
+		}
+	}
+	
+
+	/* Mark the query as executed */
+	festate->query_executed = true;
 }
 
 Datum
