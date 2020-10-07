@@ -42,6 +42,7 @@ CREATE FOREIGN TABLE fdw126_ft6(stu_id int, stu_name varchar(255))
 --Testcase 11:
 CREATE FOREIGN TABLE f_empdata(emp_id int, emp_dat bytea)
   SERVER mysql_svr OPTIONS (dbname 'mysql_fdw_regress', table_name 'empdata');
+--Testcase 40:
 CREATE FOREIGN TABLE fdw193_ft1(stu_id varchar(10), stu_name varchar(255), stu_dept int)
   SERVER mysql_svr OPTIONS (dbname 'mysql_fdw_regress1', table_name 'student1');
 
@@ -120,6 +121,7 @@ VACUUM ANALYZE f_empdata;
 
 -- Verify the before update trigger which modifies the column value which is not
 -- part of update statement.
+--Testcase 41:
 CREATE FUNCTION before_row_update_func() RETURNS TRIGGER AS $$
 BEGIN
   NEW.stu_name := NEW.stu_name || ' trigger updated!';
@@ -127,21 +129,28 @@ BEGIN
   END
 $$ language plpgsql;
 
+--Testcase 42:
 CREATE TRIGGER before_row_update_trig
 BEFORE UPDATE ON fdw126_ft1
 FOR EACH ROW EXECUTE PROCEDURE before_row_update_func();
 
+--Testcase 43:
 INSERT INTO fdw126_ft1 VALUES(1, 'One', 101);
+--Testcase 44:
 EXPLAIN (verbose, costs off)
 UPDATE fdw126_ft1 SET stu_dept = 201 WHERE stu_id = 1;
+--Testcase 45:
 UPDATE fdw126_ft1 SET stu_dept = 201 WHERE stu_id = 1;
+--Testcase 46:
 SELECT * FROM fdw126_ft1 ORDER BY stu_id;
 
 -- Throw an error when target list has row identifier column.
+--Testcase 47:
 UPDATE fdw126_ft1 SET stu_dept = 201, stu_id = 10  WHERE stu_id = 1;
 
 -- Throw an error when before row update trigger modify the row identifier
 -- column (int column) value.
+--Testcase 48:
 CREATE OR REPLACE FUNCTION before_row_update_func() RETURNS TRIGGER AS $$
 BEGIN
   NEW.stu_name := NEW.stu_name || ' trigger updated!';
@@ -150,10 +159,12 @@ BEGIN
   END
 $$ language plpgsql;
 
+--Testcase 49:
 UPDATE fdw126_ft1 SET stu_dept = 301 WHERE stu_id = 1;
 
 -- Verify the before update trigger which modifies the column value which is
 -- not part of update statement.
+--Testcase 50:
 CREATE OR REPLACE FUNCTION before_row_update_func() RETURNS TRIGGER AS $$
 BEGIN
   NEW.stu_name := NEW.stu_name || ' trigger updated!';
@@ -161,18 +172,24 @@ BEGIN
   END
 $$ language plpgsql;
 
+--Testcase 51:
 CREATE TRIGGER before_row_update_trig1
 BEFORE UPDATE ON fdw193_ft1
 FOR EACH ROW EXECUTE PROCEDURE before_row_update_func();
 
+--Testcase 52:
 INSERT INTO fdw193_ft1 VALUES('aa', 'One', 101);
+--Testcase 53:
 EXPLAIN (verbose, costs off)
 UPDATE fdw193_ft1 SET stu_dept = 201 WHERE stu_id = 'aa';
+--Testcase 54:
 UPDATE fdw193_ft1 SET stu_dept = 201 WHERE stu_id = 'aa';
+--Testcase 55:
 SELECT * FROM fdw193_ft1 ORDER BY stu_id;
 
 -- Throw an error when before row update trigger modify the row identifier
 -- column (varchar column) value.
+--Testcase 56:
 CREATE OR REPLACE FUNCTION before_row_update_func() RETURNS TRIGGER AS $$
 BEGIN
   NEW.stu_name := NEW.stu_name || ' trigger updated!';
@@ -181,9 +198,11 @@ BEGIN
   END
 $$ language plpgsql;
 
+--Testcase 57:
 UPDATE fdw193_ft1 SET stu_dept = 301 WHERE stu_id = 'aa';
 
 -- Verify the NULL assignment scenario.
+--Testcase 58:
 CREATE OR REPLACE FUNCTION before_row_update_func() RETURNS TRIGGER AS $$
 BEGIN
   NEW.stu_name := NEW.stu_name || ' trigger updated!';
@@ -192,6 +211,7 @@ BEGIN
   END
 $$ language plpgsql;
 
+--Testcase 59:
 UPDATE fdw193_ft1 SET stu_dept = 401 WHERE stu_id = 'aa';
 
 -- Cleanup
@@ -199,6 +219,7 @@ UPDATE fdw193_ft1 SET stu_dept = 401 WHERE stu_id = 'aa';
 DELETE FROM fdw126_ft1;
 --Testcase 28:
 DELETE FROM f_empdata;
+--Testcase 60:
 DELETE FROM fdw193_ft1;
 --Testcase 29:
 DROP FOREIGN TABLE f_mysql_test;
@@ -216,7 +237,9 @@ DROP FOREIGN TABLE fdw126_ft5;
 DROP FOREIGN TABLE fdw126_ft6;
 --Testcase 36:
 DROP FOREIGN TABLE f_empdata;
+--Testcase 61:
 DROP FOREIGN TABLE fdw193_ft1;
+--Testcase 62:
 DROP FUNCTION before_row_update_func();
 --Testcase 37:
 DROP USER MAPPING FOR public SERVER mysql_svr;

@@ -316,9 +316,11 @@ SELECT d.c1, d.c2, e.c1, e.c2, e.c6, e.c8
   FROM f_test_tbl2 d FULL OUTER JOIN l_test_tbl1 e ON d.c1 = e.c8 ORDER BY 1, 3;
 
 -- FDW-206; LEFT JOIN LATERAL case should not crash
+--Testcase 121:
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT * FROM f_mysql_test t1 LEFT JOIN LATERAL (
   SELECT t2.a, t1.a AS t1_a FROM f_mysql_test t2) t3 ON t1.a = t3.a ORDER BY 1;
+--Testcase 122:
 SELECT * FROM f_mysql_test t1 LEFT JOIN LATERAL (
   SELECT t2.a, t1.a AS t1_a FROM f_mysql_test t2) t3 ON t1.a = t3.a ORDER BY 1;
 
@@ -338,40 +340,56 @@ SELECT EXISTS(SELECT 1 FROM pg_enum), sum(id) from f_enum_t1;
 -- Check with the IMPORT FOREIGN SCHEMA command.  Also, check ENUM types with
 -- the IMPORT FOREIGN SCHEMA command. If the enum name is the same for multiple
 -- tables, then it should handle correctly by prefixing the table name.
+--Testcase 123:
 CREATE TYPE enum_t1_size_t AS enum('small', 'medium', 'large');
+--Testcase 124:
 CREATE TYPE enum_t2_size_t AS enum('S', 'M', 'L');
 IMPORT FOREIGN SCHEMA mysql_fdw_regress LIMIT TO (enum_t1, enum_t2)
   FROM SERVER mysql_svr INTO public;
+--Testcase 125:
 SELECT attrelid::regclass, atttypid::regtype FROM pg_attribute
   WHERE (attrelid = 'enum_t1'::regclass OR attrelid = 'enum_t2'::regclass) AND
     attnum > 1 ORDER BY 1;
+--Testcase 126:
 SELECT * FROM enum_t1 ORDER BY id;
+--Testcase 127:
 SELECT * FROM enum_t2 ORDER BY id;
+--Testcase 128:
 DROP FOREIGN TABLE enum_t1;
+--Testcase 129:
 DROP FOREIGN TABLE enum_t2;
 
 -- Parameterized queries should work correctly.
+--Testcase 130:
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT c1, c2 FROM f_test_tbl1
   WHERE c8 = (SELECT c1 FROM f_test_tbl2 WHERE c1 = (SELECT 20))
   ORDER BY c1;
+--Testcase 131:
 SELECT c1, c2 FROM f_test_tbl1
   WHERE c8 = (SELECT c1 FROM f_test_tbl2 WHERE c1 = (SELECT 20))
   ORDER BY c1;
 
+--Testcase 132:
 SELECT * FROM f_test_tbl1
   WHERE c8 NOT IN (SELECT c1 FROM f_test_tbl2 WHERE c1 = (SELECT 20))
   ORDER BY c1;
 
 -- Check parameterized queries with text/varchar column, should not crash.
+--Testcase 133:
 CREATE FOREIGN TABLE f_test_tbl3 (c1 INTEGER, c2 text, c3 text)
   SERVER mysql_svr OPTIONS (dbname 'mysql_fdw_regress', table_name 'test_tbl2');
+--Testcase 134:
 CREATE TABLE local_t1 (c1 INTEGER, c2 text);
+--Testcase 135:
 INSERT INTO local_t1 VALUES (1, 'SALES');
 
+--Testcase 136:
 SELECT c1, c2 FROM f_test_tbl3 WHERE c3 = (SELECT 'PUNE'::text) ORDER BY c1;
+--Testcase 137:
 SELECT c1, c2 FROM f_test_tbl2 WHERE c3 = (SELECT 'PUNE'::varchar) ORDER BY c1;
 
+--Testcase 138:
 SELECT * FROM local_t1 lt1 WHERE lt1.c1 =
   (SELECT count(*) FROM f_test_tbl3 ft1 WHERE ft1.c2 = lt1.c2) ORDER BY lt1.c1;
 
@@ -410,7 +428,9 @@ DROP FOREIGN TABLE f_enum_t1;
 DROP FOREIGN TABLE f_test_tbl3;
 --Testcase 120:
 DROP TYPE size_t;
+--Testcase 139:
 DROP TYPE enum_t1_size_t;
+--Testcase 140:
 DROP TYPE enum_t2_size_t;
 --Testcase 114:
 DROP FUNCTION test_param_where();
