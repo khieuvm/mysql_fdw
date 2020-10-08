@@ -1,23 +1,17 @@
 /*-------------------------------------------------------------------------
  *
  * deparse.c
- * 		Foreign-data wrapper for remote MySQL servers
+ * 		Query deparser for mysql_fdw
  *
  * Portions Copyright (c) 2012-2014, PostgreSQL Global Development Group
- *
- * Portions Copyright (c) 2004-2014, EnterpriseDB Corporation.
+ * Portions Copyright (c) 2004-2020, EnterpriseDB Corporation.
  *
  * IDENTIFICATION
  * 		deparse.c
  *
  *-------------------------------------------------------------------------
  */
-
 #include "postgres.h"
-
-#include "mysql_fdw.h"
-
-#include "pgtime.h"
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -30,14 +24,16 @@
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "datatype/timestamp.h"
+#include "mysql_fdw.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #if PG_VERSION_NUM < 120000
-	#include "optimizer/var.h"
+#include "optimizer/var.h"
 #else
-	#include "optimizer/optimizer.h"
+#include "optimizer/optimizer.h"
 #endif
 #include "parser/parsetree.h"
+#include "pgtime.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -46,7 +42,7 @@
 /* Return true if integer type */
 #define IS_INTEGER_TYPE(typid) ((typid == INT2OID) || (typid == INT4OID) || (typid == INT8OID))
 
-static char *mysql_quote_identifier(const char *s, char q);
+static char *mysql_quote_identifier(const char *str, char quotechar);
 
 /*
  * Global context for foreign_expr_walker's search of an expression tree.
@@ -82,7 +78,7 @@ typedef struct deparse_expr_cxt
 	PlannerInfo *root;			/* global planner state */
 	RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
 	StringInfo	buf;			/* output buffer to append to */
-	List	**params_list;	/* exprs that will become remote Params */
+	List	  **params_list;	/* exprs that will become remote Params */
 } deparse_expr_cxt;
 
 
@@ -96,26 +92,35 @@ static void mysql_deparse_param(Param *node, deparse_expr_cxt *context);
 #if PG_VERSION_NUM < 120000
 static void mysql_deparse_array_ref(ArrayRef *node, deparse_expr_cxt *context);
 #else
-static void mysql_deparse_array_ref(SubscriptingRef *node, deparse_expr_cxt *context);
+static void mysql_deparse_array_ref(SubscriptingRef *node,
+									deparse_expr_cxt *context);
 #endif
 static void mysql_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context);
 static void mysql_deparse_op_expr(OpExpr *node, deparse_expr_cxt *context);
-static void mysql_deparse_operator_name(StringInfo buf, Form_pg_operator opform);
-static void mysql_deparse_distinct_expr(DistinctExpr *node, deparse_expr_cxt *context);
+static void mysql_deparse_operator_name(StringInfo buf,
+										Form_pg_operator opform);
+static void mysql_deparse_distinct_expr(DistinctExpr *node,
+										deparse_expr_cxt *context);
 static void mysql_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node,
-						 deparse_expr_cxt *context);
-static void mysql_deparse_relabel_type(RelabelType *node, deparse_expr_cxt *context);
+											   deparse_expr_cxt *context);
+static void mysql_deparse_relabel_type(RelabelType *node,
+									   deparse_expr_cxt *context);
 static void mysql_deparse_bool_expr(BoolExpr *node, deparse_expr_cxt *context);
 static void mysql_deparse_null_test(NullTest *node, deparse_expr_cxt *context);
-static void mysql_deparse_array_expr(ArrayExpr *node, deparse_expr_cxt *context);
-static void mysql_print_remote_param(int paramindex, Oid paramtype, int32 paramtypmod,
-				 deparse_expr_cxt *context);
+static void mysql_deparse_array_expr(ArrayExpr *node,
+									 deparse_expr_cxt *context);
+static void mysql_print_remote_param(int paramindex, Oid paramtype,
+									 int32 paramtypmod,
+									 deparse_expr_cxt *context);
 static void mysql_print_remote_placeholder(Oid paramtype, int32 paramtypmod,
-					deparse_expr_cxt *context);
+										   deparse_expr_cxt *context);
 static void mysql_deparse_relation(StringInfo buf, Relation rel);
-static void mysql_deparse_target_list(StringInfo buf, PlannerInfo *root, Index rtindex, Relation rel,
-					Bitmapset *attrs_used, List **retrieved_attrs, List *tlist, RelOptInfo *baserel);
-static void mysql_deparse_column_ref(StringInfo buf, int varno, int varattno, PlannerInfo *root);
+static void mysql_deparse_target_list(StringInfo buf, PlannerInfo *root,
+									  Index rtindex, Relation rel,
+									  Bitmapset *attrs_used,
+									  List **retrieved_attrs);
+static void mysql_deparse_column_ref(StringInfo buf, int varno, int varattno,
+									 PlannerInfo *root);
 static bool mysql_deparse_op_divide(Expr *node, deparse_expr_cxt *context);
 
 /*
@@ -129,19 +134,19 @@ static void deparse_interval(StringInfo buf, Datum datum);
 static char *cur_opname = NULL;
 
 /*
- * Append remote name of specified foreign table to buf.
- * Use value of table_name FDW option (if any) instead of relation's name.
- * Similarly, schema_name FDW option overrides schema name.
+ * Append remote name of specified foreign table to buf.  Use value of
+ * table_name FDW option (if any) instead of relation's name.  Similarly,
+ * schema_name FDW option overrides schema name.
  */
 static void
 mysql_deparse_relation(StringInfo buf, Relation rel)
 {
-	ForeignTable  *table;
-	const char    *nspname = NULL;
-	const char    *relname = NULL;
-	ListCell      *lc = NULL;
+	ForeignTable *table;
+	const char *nspname = NULL;
+	const char *relname = NULL;
+	ListCell   *lc;
 
-	/* obtain additional catalog information. */
+	/* Obtain additional catalog information. */
 	table = GetForeignTable(RelationGetRelid(rel));
 
 	/*
@@ -149,7 +154,7 @@ mysql_deparse_relation(StringInfo buf, Relation rel)
 	 */
 	foreach(lc, table->options)
 	{
-		DefElem *def = (DefElem *) lfirst(lc);
+		DefElem    *def = (DefElem *) lfirst(lc);
 
 		if (strcmp(def->defname, "dbname") == 0)
 			nspname = defGetString(def);
@@ -166,40 +171,37 @@ mysql_deparse_relation(StringInfo buf, Relation rel)
 	if (relname == NULL)
 		relname = RelationGetRelationName(rel);
 
-	appendStringInfo(buf, "%s.%s", mysql_quote_identifier(nspname, '`'), mysql_quote_identifier(relname, '`'));
+	appendStringInfo(buf, "%s.%s", mysql_quote_identifier(nspname, '`'),
+					 mysql_quote_identifier(relname, '`'));
 }
 
 static char *
-mysql_quote_identifier(const char *s , char q)
+mysql_quote_identifier(const char *str, char quotechar)
 {
-	char  *result = palloc(strlen(s) * 2 + 3);
-	char  *r = result;
+	char	   *result = palloc(strlen(str) * 2 + 3);
+	char	   *res = result;
 
-	*r++ = q;
-	while (*s)
+	*res++ = quotechar;
+	while (*str)
 	{
-		if (*s == q)
-			*r++ = *s;
-		*r++ = *s;
-		s++;
+		if (*str == quotechar)
+			*res++ = *str;
+		*res++ = *str;
+		str++;
 	}
-	*r++ = q;
-	*r++ = '\0';
+	*res++ = quotechar;
+	*res++ = '\0';
+
 	return result;
 }
 
-
 /*
- * Deparese SELECT statment
+ * Deparse SELECT statement
  */
 void
-mysql_deparse_select(StringInfo buf,
-				 PlannerInfo *root,
-				 RelOptInfo *baserel,
-				 Bitmapset *attrs_used,
-				 char *svr_table,
-				 List **retrieved_attrs,
-				 List *tlist)
+mysql_deparse_select(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel,
+					 Bitmapset *attrs_used, char *svr_table,
+					 List **retrieved_attrs)
 {
 	RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
 	Relation	rel;
@@ -208,41 +210,50 @@ mysql_deparse_select(StringInfo buf,
 	 * Core code already has some lock on each rel being planned, so we can
 	 * use NoLock here.
 	 */
+#if PG_VERSION_NUM < 130000
 	rel = heap_open(rte->relid, NoLock);
+#else
+	rel = table_open(rte->relid, NoLock);
+#endif
 
 	appendStringInfoString(buf, "SELECT ");
-	mysql_deparse_target_list(buf, root, baserel->relid, rel, attrs_used, 
-							  retrieved_attrs, tlist, baserel);
+	mysql_deparse_target_list(buf, root, baserel->relid, rel, attrs_used,
+							  retrieved_attrs);
 
 	/*
 	 * Construct FROM clause
 	 */
 	appendStringInfoString(buf, " FROM ");
 	mysql_deparse_relation(buf, rel);
+
+#if PG_VERSION_NUM < 130000
 	heap_close(rel, NoLock);
+#else
+	table_close(rel, NoLock);
+#endif
 }
 
 /*
- * deparse remote INSERT statement
+ * Deparse remote INSERT statement
  *
  * The statement text is appended to buf, and we also create an integer List
  * of the columns being retrieved by RETURNING (if any), which is returned
  * to *retrieved_attrs.
  */
 void
-mysql_deparse_insert(StringInfo buf, PlannerInfo *root,
-				 Index rtindex, Relation rel,
-				 List *targetAttrs)
+mysql_deparse_insert(StringInfo buf, PlannerInfo *root, Index rtindex,
+					 Relation rel, List *targetAttrs)
 {
-	AttrNumber  pindex;
-	bool        first;
-	ListCell    *lc;
+	ListCell   *lc;
 
 	appendStringInfoString(buf, "INSERT INTO ");
 	mysql_deparse_relation(buf, rel);
 
 	if (targetAttrs)
 	{
+		AttrNumber	pindex;
+		bool		first;
+
 		appendStringInfoChar(buf, '(');
 
 		first = true;
@@ -283,7 +294,8 @@ mysql_deparse_analyze(StringInfo sql, char *dbname, char *relname)
 	appendStringInfo(sql, "SELECT");
 	appendStringInfo(sql, " round(((data_length + index_length)), 2)");
 	appendStringInfo(sql, " FROM information_schema.TABLES");
-	appendStringInfo(sql, " WHERE table_schema = '%s' AND table_name = '%s'", dbname, relname);
+	appendStringInfo(sql, " WHERE table_schema = '%s' AND table_name = '%s'",
+					 dbname, relname);
 }
 
 /*
@@ -291,78 +303,46 @@ mysql_deparse_analyze(StringInfo sql, char *dbname, char *relname)
  * This is used for both SELECT and RETURNING targetlists.
  */
 static void
-mysql_deparse_target_list(StringInfo buf,
-				  PlannerInfo *root,
-				  Index rtindex,
-				  Relation rel,
-				  Bitmapset *attrs_used,
-				  List **retrieved_attrs,
-				  List *tlist,
-				  RelOptInfo *baserel)
+mysql_deparse_target_list(StringInfo buf, PlannerInfo *root, Index rtindex,
+						  Relation rel, Bitmapset *attrs_used,
+						  List **retrieved_attrs)
 {
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	bool		have_wholerow;
 	bool		first;
 	int			i;
 
-	ListCell *cell;
 	/* If there's a whole-row reference, we'll need all the columns. */
 	have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
 								  attrs_used);
+
 	first = true;
-	
-	if (retrieved_attrs)
+
+	*retrieved_attrs = NIL;
+	for (i = 1; i <= tupdesc->natts; i++)
 	{
-		/* Not pushdown target list */
-		*retrieved_attrs = NIL;
-		for (i = 1; i <= tupdesc->natts; i++)
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
+
+		/* Ignore dropped attributes. */
+		if (attr->attisdropped)
+			continue;
+
+		if (have_wholerow ||
+			bms_is_member(i - FirstLowInvalidHeapAttributeNumber, attrs_used))
 		{
-			Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
-
-			/* Ignore dropped attributes. */
-			if (attr->attisdropped)
-				continue;
-
-			if (have_wholerow ||
-				bms_is_member(i - FirstLowInvalidHeapAttributeNumber,
-							  attrs_used))
-			{
-				if (!first)
-					appendStringInfoString(buf, ", ");
-				first = false;
-
-				mysql_deparse_column_ref(buf, rtindex, i, root);
-				*retrieved_attrs = lappend_int(*retrieved_attrs, i);
-			}
-		}
-	}
-	else
-	{
-		/* Pushdown target list */
-
-		/* Set up context struct for recursion */
-		deparse_expr_cxt context;
-		context.root = root;
-		context.foreignrel = baserel;
-		context.buf = buf;
-		context.params_list = NULL;
-		foreach (cell, tlist)
-		{
-			Expr *expr = ((TargetEntry *)lfirst(cell))->expr;
-
 			if (!first)
 				appendStringInfoString(buf, ", ");
 			first = false;
 
-			/* Deparse target list for push down */
-			deparseExpr(expr, &context);
+			mysql_deparse_column_ref(buf, rtindex, i, root);
+			*retrieved_attrs = lappend_int(*retrieved_attrs, i);
 		}
 	}
+
 	/* Don't generate bad syntax if no undropped columns */
 	if (first)
 		appendStringInfoString(buf, "NULL");
 }
-
 
 /*
  * Deparse WHERE clauses in given list of RestrictInfos and append them to buf.
@@ -379,12 +359,9 @@ mysql_deparse_target_list(StringInfo buf,
  * so Params and other-relation Vars should be replaced by dummy values.
  */
 void
-mysql_append_where_clause(StringInfo buf,
-				  PlannerInfo *root,
-				  RelOptInfo *baserel,
-				  List *exprs,
-				  bool is_first,
-				  List **params)
+mysql_append_where_clause(StringInfo buf, PlannerInfo *root,
+						  RelOptInfo *baserel, List *exprs, bool is_first,
+						  List **params)
 {
 	deparse_expr_cxt context;
 	ListCell   *lc;
@@ -416,18 +393,18 @@ mysql_append_where_clause(StringInfo buf,
 	}
 }
 
-
 /*
- * Construct name to use for given column, and emit it into buf.
- * If it has a column_name FDW option, use that instead of attribute name.
+ * Construct name to use for given column, and emit it into buf.  If it has a
+ * column_name FDW option, use that instead of attribute name.
  */
 static void
-mysql_deparse_column_ref(StringInfo buf, int varno, int varattno, PlannerInfo *root)
+mysql_deparse_column_ref(StringInfo buf, int varno, int varattno,
+						 PlannerInfo *root)
 {
 	RangeTblEntry *rte;
-	char          *colname = NULL;
-	List          *options;
-	ListCell      *lc;
+	char	   *colname = NULL;
+	List	   *options;
+	ListCell   *lc;
 
 	/* varno must not be any of OUTER_VAR, INNER_VAR and INDEX_VAR. */
 	Assert(!IS_SPECIAL_VARNO(varno));
@@ -442,7 +419,7 @@ mysql_deparse_column_ref(StringInfo buf, int varno, int varattno, PlannerInfo *r
 	options = GetForeignColumnOptions(rte->relid, varattno);
 	foreach(lc, options)
 	{
-		DefElem *def = (DefElem *) lfirst(lc);
+		DefElem    *def = (DefElem *) lfirst(lc);
 
 		if (strcmp(def->defname, "column_name") == 0)
 		{
@@ -465,38 +442,35 @@ mysql_deparse_column_ref(StringInfo buf, int varno, int varattno, PlannerInfo *r
 	appendStringInfoString(buf, mysql_quote_identifier(colname, '`'));
 }
 
-
 static void
 mysql_deparse_string(StringInfo buf, const char *val, bool isstr)
 {
 	const char *valptr;
-	int i = -1;
+	int			i = 0;
 
-	for (valptr = val; *valptr; valptr++)
+	if (isstr)
+		appendStringInfoChar(buf, '\'');
+
+	for (valptr = val; *valptr; valptr++,i++)
 	{
-		char ch = *valptr;
-		i++;
-
-		if (i == 0 && isstr)
-			appendStringInfoChar(buf, '\'');
+		char		ch = *valptr;
 
 		/*
-		 * Remove '{', '}' and \" character from the string. Because
-		 * this syntax is not recognize by the remote MySQL server.
+		 * Remove '{', '}', and \" character from the string. Because this
+		 * syntax is not recognize by the remote MySQL server.
 		 */
-		if ((ch == '{' && i == 0) || (ch == '}' && (i == (strlen(val) - 1))) || ch == '\"')
+		if ((ch == '{' && i == 0) || (ch == '}' && (i == (strlen(val) - 1))) ||
+			ch == '\"')
 			continue;
 
-		if (ch == ',' && isstr)
+		if (isstr && ch == ',')
 		{
-			appendStringInfoChar(buf, '\'');
-			appendStringInfoChar(buf, ch);
-			appendStringInfoChar(buf, ' ');
-			appendStringInfoChar(buf, '\'');
+			appendStringInfoString(buf, "', '");
 			continue;
 		}
 		appendStringInfoChar(buf, ch);
 	}
+
 	if (isstr)
 		appendStringInfoChar(buf, '\'');
 }
@@ -508,16 +482,21 @@ static void
 mysql_deparse_string_literal(StringInfo buf, const char *val)
 {
 	const char *valptr;
+
 	appendStringInfoChar(buf, '\'');
+
 	for (valptr = val; *valptr; valptr++)
 	{
-		char	ch = *valptr;
+		char		ch = *valptr;
+
 		if (SQL_STR_DOUBLE(ch, true))
-		appendStringInfoChar(buf, ch);
+			appendStringInfoChar(buf, ch);
 		appendStringInfoChar(buf, ch);
 	}
+
 	appendStringInfoChar(buf, '\'');
 }
+
 /*
  * Deparse given expression into context->buf.
  *
@@ -563,7 +542,8 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 			mysql_deparse_distinct_expr((DistinctExpr *) node, context);
 			break;
 		case T_ScalarArrayOpExpr:
-			mysql_deparse_scalar_array_op_expr((ScalarArrayOpExpr *) node, context);
+			mysql_deparse_scalar_array_op_expr((ScalarArrayOpExpr *) node,
+											   context);
 			break;
 		case T_RelabelType:
 			mysql_deparse_relabel_type((RelabelType *) node, context);
@@ -638,22 +618,20 @@ do { \
 	}
 }
 
-
 /*
- * deparse remote UPDATE statement
+ * Deparse remote UPDATE statement
  *
  * The statement text is appended to buf, and we also create an integer List
  * of the columns being retrieved by RETURNING (if any), which is returned
  * to *retrieved_attrs.
  */
 void
-mysql_deparse_update(StringInfo buf, PlannerInfo *root,
-				 Index rtindex, Relation rel,
-				 List *targetAttrs, char *attname)
+mysql_deparse_update(StringInfo buf, PlannerInfo *root, Index rtindex,
+					 Relation rel, List *targetAttrs, char *attname)
 {
-	AttrNumber  pindex;
-	bool        first;
-	ListCell    *lc;
+	AttrNumber	pindex;
+	bool		first;
+	ListCell   *lc;
 
 	appendStringInfoString(buf, "UPDATE ");
 	mysql_deparse_relation(buf, rel);
@@ -663,7 +641,8 @@ mysql_deparse_update(StringInfo buf, PlannerInfo *root,
 	first = true;
 	foreach(lc, targetAttrs)
 	{
-		int attnum = lfirst_int(lc);
+		int			attnum = lfirst_int(lc);
+
 		if (attnum == 1)
 			continue;
 
@@ -675,21 +654,20 @@ mysql_deparse_update(StringInfo buf, PlannerInfo *root,
 		appendStringInfo(buf, " = ?");
 		pindex++;
 	}
+
 	appendStringInfo(buf, " WHERE %s = ?", attname);
 }
 
-
 /*
- * deparse remote DELETE statement
+ * Deparse remote DELETE statement
  *
  * The statement text is appended to buf, and we also create an integer List
  * of the columns being retrieved by RETURNING (if any), which is returned
  * to *retrieved_attrs.
  */
 void
-mysql_deparse_delete(StringInfo buf, PlannerInfo *root,
-				 Index rtindex, Relation rel,
-				 char *name)
+mysql_deparse_delete(StringInfo buf, PlannerInfo *root, Index rtindex,
+					 Relation rel, char *name)
 {
 	appendStringInfoString(buf, "DELETE FROM ");
 	mysql_deparse_relation(buf, rel);
@@ -713,17 +691,18 @@ mysql_deparse_var(Var *node, deparse_expr_cxt *context)
 		node->varlevelsup == 0)
 	{
 		/* Var belongs to foreign table */
-		mysql_deparse_column_ref(buf, node->varno, node->varattno, context->root);
+		mysql_deparse_column_ref(buf, node->varno, node->varattno,
+								 context->root);
 	}
 	else
 	{
 		/* Treat like a Param */
 		if (context->params_list)
 		{
-			int pindex = 0;
-			ListCell *lc;
+			int			pindex = 0;
+			ListCell   *lc;
 
-			/* find its index in params_list */
+			/* Find its index in params_list */
 			foreach(lc, *context->params_list)
 			{
 				pindex++;
@@ -732,16 +711,16 @@ mysql_deparse_var(Var *node, deparse_expr_cxt *context)
 			}
 			if (lc == NULL)
 			{
-				/* not in list, so add it */
+				/* Not in list, so add it */
 				pindex++;
 				*context->params_list = lappend(*context->params_list, node);
 			}
-			mysql_print_remote_param(pindex, node->vartype, node->vartypmod, context);
+			mysql_print_remote_param(pindex, node->vartype, node->vartypmod,
+									 context);
 		}
 		else
-		{
-			mysql_print_remote_placeholder(node->vartype, node->vartypmod, context);
-		}
+			mysql_print_remote_placeholder(node->vartype, node->vartypmod,
+										   context);
 	}
 }
 
@@ -753,10 +732,10 @@ mysql_deparse_var(Var *node, deparse_expr_cxt *context)
 static void
 mysql_deparse_const(Const *node, deparse_expr_cxt *context)
 {
-	StringInfo  buf = context->buf;
-	Oid         typoutput;
-	bool        typIsVarlena;
-	char        *extval;
+	StringInfo	buf = context->buf;
+	Oid			typoutput;
+	bool		typIsVarlena;
+	char	   *extval;
 
 	if (node->constisnull)
 	{
@@ -764,8 +743,7 @@ mysql_deparse_const(Const *node, deparse_expr_cxt *context)
 		return;
 	}
 
-	getTypeOutputInfo(node->consttype,
-					  &typoutput, &typIsVarlena);
+	getTypeOutputInfo(node->consttype, &typoutput, &typIsVarlena);
 
 	switch (node->consttype)
 	{
@@ -778,6 +756,7 @@ mysql_deparse_const(Const *node, deparse_expr_cxt *context)
 		case NUMERICOID:
 			{
 				extval = OidOutputFunctionCall(typoutput, node->constvalue);
+
 				/*
 				 * No need to quote unless it's a special value such as 'NaN'.
 				 * See comments in get_const_expr().
@@ -808,23 +787,24 @@ mysql_deparse_const(Const *node, deparse_expr_cxt *context)
 		case INTERVALOID:
 			deparse_interval(buf, node->constvalue);
 			break;
-                case BYTEAOID:
-                        /*
-			 * the string for BYTEA always seems to be in the format "\\x##"
-                         * where # is a hex digit, Even if the value passed in is 'hi'::bytea
-                         * we will receive "\x6869". Making this assumption allows us to
-                         * quickly convert postgres escaped strings to mysql ones for comparison
+		case BYTEAOID:
+			/*
+			 * The string for BYTEA always seems to be in the format "\\x##"
+			 * where # is a hex digit, Even if the value passed in is
+			 * 'hi'::bytea we will receive "\x6869". Making this assumption
+			 * allows us to quickly convert postgres escaped strings to mysql
+			 * ones for comparison
 			 */
-                        extval = OidOutputFunctionCall(typoutput, node->constvalue);
-                        appendStringInfo(buf, "X\'%s\'", extval + 2);
-                        break;			
+			extval = OidOutputFunctionCall(typoutput, node->constvalue);
+			appendStringInfo(buf, "X\'%s\'", extval + 2);
+			break;
 		default:
 			extval = OidOutputFunctionCall(typoutput, node->constvalue);
 			mysql_deparse_string_literal(buf, extval);
 			break;
 	}
 }
-     
+
 /*
  * Deparse given Param node.
  *
@@ -838,10 +818,10 @@ mysql_deparse_param(Param *node, deparse_expr_cxt *context)
 {
 	if (context->params_list)
 	{
-		int pindex = 0;
-		ListCell *lc;
+		int			pindex = 0;
+		ListCell   *lc;
 
-		/* find its index in params_list */
+		/* Find its index in params_list */
 		foreach(lc, *context->params_list)
 		{
 			pindex++;
@@ -850,17 +830,17 @@ mysql_deparse_param(Param *node, deparse_expr_cxt *context)
 		}
 		if (lc == NULL)
 		{
-			/* not in list, so add it */
+			/* Not in list, so add it */
 			pindex++;
 			*context->params_list = lappend(*context->params_list, node);
 		}
 
-		mysql_print_remote_param(pindex, node->paramtype, node->paramtypmod, context);
+		mysql_print_remote_param(pindex, node->paramtype, node->paramtypmod,
+								 context);
 	}
 	else
-	{
-		mysql_print_remote_placeholder(node->paramtype, node->paramtypmod, context);
-	}
+		mysql_print_remote_placeholder(node->paramtype, node->paramtypmod,
+									   context);
 }
 
 /*
@@ -904,7 +884,11 @@ mysql_deparse_array_ref(SubscriptingRef *node, deparse_expr_cxt *context)
 		{
 			deparseExpr(lfirst(lowlist_item), context);
 			appendStringInfoChar(buf, ':');
+#if PG_VERSION_NUM < 130000
 			lowlist_item = lnext(lowlist_item);
+#else
+			lowlist_item = lnext(node->reflowerindexpr, lowlist_item);
+#endif
 		}
 		deparseExpr(lfirst(uplist_item), context);
 		appendStringInfoChar(buf, ']');
@@ -914,30 +898,30 @@ mysql_deparse_array_ref(SubscriptingRef *node, deparse_expr_cxt *context)
 }
 
 /*
- * This possible that name of function in PostgreSQL and
- * mysql differ, so return the mysql equelent function name
+ * This is possible that the name of function in PostgreSQL and mysql differ,
+ * so return the mysql eloquent function name.
  */
-static char*
+static char *
 mysql_replace_function(char *in)
 {
 	if (strcmp(in, "btrim") == 0)
-	{
 		return "trim";
-	}
+
 	return in;
 }
+
 /*
  * Deparse a function call.
  */
 static void
 mysql_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 {
-	StringInfo     buf = context->buf;
-	HeapTuple      proctup;
-	Form_pg_proc   procform;
-	const char     *proname;
-	bool           first;
-	ListCell       *arg;
+	StringInfo	buf = context->buf;
+	HeapTuple	proctup;
+	Form_pg_proc procform;
+	const char *proname;
+	bool		first;
+	ListCell   *arg;
 
 	/*
 	 * If the function call came from an implicit coercion, then just show the
@@ -955,6 +939,7 @@ mysql_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(node->funcid));
 	if (!HeapTupleIsValid(proctup))
 		elog(ERROR, "cache lookup failed for function %u", node->funcid);
+
 	procform = (Form_pg_proc) GETSTRUCT(proctup);
 
 	/* Translate PostgreSQL function into mysql function */
@@ -1133,7 +1118,7 @@ mysql_deparse_op_divide(Expr *node, deparse_expr_cxt *context)
 }
 
 /*
- * Deparse given operator expression.   To avoid problems around
+ * Deparse given operator expression.  To avoid problems around
  * priority of operations, we always parenthesize the arguments.
  */
 static void
@@ -1150,6 +1135,7 @@ mysql_deparse_op_expr(OpExpr *node, deparse_expr_cxt *context)
 	tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(node->opno));
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for operator %u", node->opno);
+
 	form = (Form_pg_operator) GETSTRUCT(tuple);
 	oprkind = form->oprkind;
 
@@ -1218,41 +1204,23 @@ mysql_deparse_operator_name(StringInfo buf, Form_pg_operator opform)
 	else
 	{
 		if (strcmp(cur_opname, "~~") == 0)
-		{
 			appendStringInfoString(buf, "LIKE BINARY");
-		}
 		else if (strcmp(cur_opname, "~~*") == 0)
-		{
 			appendStringInfoString(buf, "LIKE");
-		}
 		else if (strcmp(cur_opname, "!~~") == 0)
-		{
 			appendStringInfoString(buf, "NOT LIKE BINARY");
-		}
 		else if (strcmp(cur_opname, "!~~*") == 0)
-		{
 			appendStringInfoString(buf, "NOT LIKE");
-		}
 		else if (strcmp(cur_opname, "~") == 0)
-		{
 			appendStringInfoString(buf, "REGEXP BINARY");
-		}
 		else if (strcmp(cur_opname, "~*") == 0)
-		{
 			appendStringInfoString(buf, "REGEXP");
-		}
 		else if (strcmp(cur_opname, "!~") == 0)
-		{
 			appendStringInfoString(buf, "NOT REGEXP BINARY");
-		}
 		else if (strcmp(cur_opname, "!~*") == 0)
-		{
 			appendStringInfoString(buf, "NOT REGEXP");
-		}
 		else
-		{
 			appendStringInfoString(buf, cur_opname);
-		}
 	}
 }
 
@@ -1278,17 +1246,18 @@ mysql_deparse_distinct_expr(DistinctExpr *node, deparse_expr_cxt *context)
  * around priority of operations, we always parenthesize the arguments.
  */
 static void
-mysql_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node, deparse_expr_cxt *context)
+mysql_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node,
+								   deparse_expr_cxt *context)
 {
-	StringInfo        buf = context->buf;
-	HeapTuple         tuple;
-	Expr              *arg1;
-	Expr              *arg2;
-	Form_pg_operator  form;
-	char              *opname;
-	Oid               typoutput;
-	bool              typIsVarlena;
-	char              *extval;
+	StringInfo	buf = context->buf;
+	HeapTuple	tuple;
+	Expr	   *arg1;
+	Expr	   *arg2;
+	Form_pg_operator form;
+	char	   *opname;
+	Oid			typoutput;
+	bool		typIsVarlena;
+	char	   *extval;
 
 	/* Retrieve information about the operator from system catalog. */
 	tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(node->opno));
@@ -1335,15 +1304,20 @@ mysql_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node, deparse_expr_cxt *co
 		appendStringInfoChar(buf, ',');
 	}
 
-	switch (nodeTag((Node*)arg2))
+	switch (nodeTag((Node *) arg2))
 	{
 		case T_Const:
-		{
-			Const *c = (Const*)arg2;
-			if (!c->constisnull)
 			{
-				getTypeOutputInfo(c->consttype,
-								&typoutput, &typIsVarlena);
+				Const	   *c = (Const *) arg2;
+
+				if (c->constisnull)
+				{
+					appendStringInfoString(buf, " NULL");
+					ReleaseSysCache(tuple);
+					return;
+				}
+
+				getTypeOutputInfo(c->consttype, &typoutput, &typIsVarlena);
 				extval = OidOutputFunctionCall(typoutput, c->constvalue);
 
 				switch (c->consttype)
@@ -1357,18 +1331,13 @@ mysql_deparse_scalar_array_op_expr(ScalarArrayOpExpr *node, deparse_expr_cxt *co
 						break;
 				}
 			}
-			else
-			{
-				appendStringInfoString(buf, " NULL");
-				return;
-			}
-		}
-		break;
+			break;
 		default:
 			deparseExpr(arg2, context);
 			break;
 	}
 	appendStringInfoChar(buf, ')');
+
 	ReleaseSysCache(tuple);
 }
 
@@ -1393,7 +1362,7 @@ mysql_deparse_bool_expr(BoolExpr *node, deparse_expr_cxt *context)
 	StringInfo	buf = context->buf;
 	const char *op = NULL;		/* keep compiler quiet */
 	bool		first;
-	ListCell *lc;
+	ListCell   *lc;
 
 	switch (node->boolop)
 	{
@@ -1404,7 +1373,8 @@ mysql_deparse_bool_expr(BoolExpr *node, deparse_expr_cxt *context)
 			op = "OR";
 			break;
 		case NOT_EXPR:
-			appendStringInfoString(buf, "(NOT ");
+			appendStringInfoChar(buf, '(');
+			appendStringInfoString(buf, "NOT ");
 			deparseExpr(linitial(node->args), context);
 			appendStringInfoChar(buf, ')');
 			return;
@@ -1433,9 +1403,10 @@ mysql_deparse_null_test(NullTest *node, deparse_expr_cxt *context)
 	appendStringInfoChar(buf, '(');
 	deparseExpr(node->arg, context);
 	if (node->nulltesttype == IS_NULL)
-		appendStringInfoString(buf, " IS NULL)");
+		appendStringInfoString(buf, " IS NULL");
 	else
-		appendStringInfoString(buf, " IS NOT NULL)");
+		appendStringInfoString(buf, " IS NOT NULL");
+	appendStringInfoChar(buf, ')');
 }
 
 /*
@@ -1469,7 +1440,7 @@ mysql_deparse_array_expr(ArrayExpr *node, deparse_expr_cxt *context)
  */
 static void
 mysql_print_remote_param(int paramindex, Oid paramtype, int32 paramtypmod,
-				 deparse_expr_cxt *context)
+						 deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
 
@@ -1478,9 +1449,10 @@ mysql_print_remote_param(int paramindex, Oid paramtype, int32 paramtypmod,
 
 static void
 mysql_print_remote_placeholder(Oid paramtype, int32 paramtypmod,
-					   deparse_expr_cxt *context)
+							   deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
+
 	appendStringInfo(buf, "(SELECT null)");
 }
 
@@ -1508,7 +1480,6 @@ is_builtin(Oid oid)
 	return (oid < FirstBootstrapObjectId);
 }
 
-
 /*
  * Check if expression is safe to execute remotely, and return true if so.
  *
@@ -1517,13 +1488,12 @@ is_builtin(Oid oid)
  * We must check that the expression contains only node types we can deparse,
  * that all types/functions/operators are safe to send (which we approximate
  * as being built-in), and that all collations used in the expression derive
- * from Vars of the foreign table.  Because of the latter, the logic is
- * pretty close to assign_collations_walker() in parse_collate.c, though we
- * can assume here that the given expression is valid.
+ * from Vars of the foreign table.  Because of the latter, the logic is pretty
+ * close to assign_collations_walker() in parse_collate.c, though we can assume
+ * here that the given expression is valid.
  */
 static bool
-foreign_expr_walker(Node *node,
-					foreign_glob_cxt *glob_cxt,
+foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 					foreign_loc_cxt *outer_cxt)
 {
 	bool		check_type = true;
@@ -1550,7 +1520,7 @@ foreign_expr_walker(Node *node,
 				 * If the Var is from the foreign table, we consider its
 				 * collation (if any) safe to use.  If it is from another
 				 * table, we treat its collation the same way as we would a
-				 * Param's collation, ie it's not safe for it to have a
+				 * Param's collation, i.e. it's not safe for it to have a
 				 * non-default collation.
 				 */
 				if (var->varno == glob_cxt->foreignrel->relid &&
@@ -1578,8 +1548,8 @@ foreign_expr_walker(Node *node,
 				Const	   *c = (Const *) node;
 
 				/*
-				 * If the constant has nondefault collation, either it's of a
-				 * non-builtin type, or it reflects folding of a CollateExpr;
+				 * If the constant has non default collation, either it's of a
+				 * non-built in type, or it reflects folding of a CollateExpr;
 				 * either way, it's unsafe to send to the remote.
 				 */
 				if (c->constcollid != InvalidOid &&
@@ -1613,7 +1583,7 @@ foreign_expr_walker(Node *node,
 #else
 		case T_SubscriptingRef:
 			{
-				SubscriptingRef   *ar = (SubscriptingRef *) node;
+				SubscriptingRef *ar = (SubscriptingRef *) node;
 #endif
 
 				/* Assignment should not be in restrictions. */
@@ -1954,29 +1924,26 @@ foreign_expr_walker(Node *node,
  * Returns true if given expr is safe to evaluate on the foreign server.
  */
 bool
-mysql_is_foreign_expr(PlannerInfo *root,
-                                RelOptInfo *baserel,
-                                Expr *expr)
+mysql_is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr *expr)
 {
-        foreign_glob_cxt glob_cxt;
-        foreign_loc_cxt loc_cxt;
+	foreign_glob_cxt glob_cxt;
+	foreign_loc_cxt loc_cxt;
 
-        /*
-         * Check that the expression consists of nodes that are safe to execute
-         * remotely.
-         */
-        glob_cxt.root = root;
-        glob_cxt.foreignrel = baserel;
-        loc_cxt.collation = InvalidOid;
-        loc_cxt.state = FDW_COLLATE_NONE;
-        if (!foreign_expr_walker((Node *) expr, &glob_cxt, &loc_cxt))
-                return false;
+	/*
+	 * Check that the expression consists of nodes that are safe to execute
+	 * remotely.
+	 */
+	glob_cxt.root = root;
+	glob_cxt.foreignrel = baserel;
+	loc_cxt.collation = InvalidOid;
+	loc_cxt.state = FDW_COLLATE_NONE;
+	if (!foreign_expr_walker((Node *) expr, &glob_cxt, &loc_cxt))
+		return false;
 
-        /* Expressions examined here should be boolean, ie noncollatable */
-        Assert(loc_cxt.collation == InvalidOid);
-        Assert(loc_cxt.state == FDW_COLLATE_NONE);
+	/* Expressions examined here should be boolean, ie noncollatable */
+	Assert(loc_cxt.collation == InvalidOid);
+	Assert(loc_cxt.state == FDW_COLLATE_NONE);
 
-        /* OK to evaluate on the remote server */
-        return true;
+	/* OK to evaluate on the remote server */
+	return true;
 }
-
