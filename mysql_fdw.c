@@ -107,9 +107,9 @@ unsigned int ((mysql_warning_count)(MYSQL *mysql));
 
 /*
  * In PG 9.5.1 the number will be 90501,
- * our version is 2.5.4 so number will be 20504
+ * our version is 2.5.5 so number will be 20505
  */
-#define CODE_VERSION   20504
+#define CODE_VERSION   20505
 
 typedef struct MySQLFdwRelationInfo
 {
