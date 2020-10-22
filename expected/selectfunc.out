@@ -1,0 +1,573 @@
+SET datestyle=ISO;
+SET timezone='Japan';
+--Testcase 1:
+CREATE EXTENSION mysql_fdw;
+--Testcase 2:
+CREATE SERVER server1 FOREIGN DATA WRAPPER mysql_fdw;
+--Testcase 3:
+CREATE USER MAPPING FOR CURRENT_USER SERVER server1 OPTIONS(username 'edb', password 'edb');
+--IMPORT FOREIGN SCHEMA public FROM SERVER server1 INTO public OPTIONS(import_time_text 'false');
+--Testcase 4:
+CREATE FOREIGN TABLE s3(id int, tag1 text, value1 float, value2 int, value3 float, value4 int, str1 text, str2 text) SERVER server1 OPTIONS(dbname 'mysql_fdw_regress', table_name 's3');
+-- s3 (value1 as float8, value2 as bigint)
+--Testcase 5:
+\d s3;
+                        Foreign table "public.s3"
+ Column |       Type       | Collation | Nullable | Default | FDW options 
+--------+------------------+-----------+----------+---------+-------------
+ id     | integer          |           |          |         | 
+ tag1   | text             |           |          |         | 
+ value1 | double precision |           |          |         | 
+ value2 | integer          |           |          |         | 
+ value3 | double precision |           |          |         | 
+ value4 | integer          |           |          |         | 
+ str1   | text             |           |          |         | 
+ str2   | text             |           |          |         | 
+Server: server1
+FDW options: (dbname 'mysql_fdw_regress', table_name 's3')
+
+--Testcase 6:
+SELECT * FROM s3;
+ id | tag1 | value1 | value2 | value3 | value4 |   str1    |   str2    
+----+------+--------+--------+--------+--------+-----------+-----------
+  0 | a    |    0.1 |    100 |   -0.1 |   -100 | ---XYZ--- |    XYZ   
+  1 | a    |    0.2 |    100 |   -0.2 |   -100 | ---XYZ--- |    XYZ   
+  2 | a    |    0.3 |    100 |   -0.3 |   -100 | ---XYZ--- |    XYZ   
+  3 | b    |    1.1 |    200 |   -1.1 |   -200 | ---XYZ--- |    XYZ   
+  4 | b    |    2.2 |    200 |   -2.2 |   -200 | ---XYZ--- |    XYZ   
+  5 | b    |    3.3 |    200 |   -3.3 |   -200 | ---XYZ--- |    XYZ   
+(6 rows)
+
+-- select float8() (not pushdown, remove float8, explain)
+--Testcase 7:
+EXPLAIN VERBOSE
+SELECT float8(value1), float8(value2), float8(value3), float8(value4) FROM s3;
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1015.00 rows=1000 width=32)
+   Output: value1, float8(value2), value3, float8(value4)
+   Local server startup cost: 10
+   Remote query: SELECT `value1`, `value2`, `value3`, `value4` FROM `mysql_fdw_regress`.`s3`
+(4 rows)
+
+-- select float8() (not pushdown, remove float8, result)
+--Testcase 8:
+SELECT float8(value1), float8(value2), float8(value3), float8(value4) FROM s3;
+ float8 | float8 | float8 | float8 
+--------+--------+--------+--------
+    0.1 |    100 |   -0.1 |   -100
+    0.2 |    100 |   -0.2 |   -100
+    0.3 |    100 |   -0.3 |   -100
+    1.1 |    200 |   -1.1 |   -200
+    2.2 |    200 |   -2.2 |   -200
+    3.3 |    200 |   -3.3 |   -200
+(6 rows)
+
+-- select sqrt (builtin function, explain)
+--Testcase 9:
+EXPLAIN VERBOSE
+SELECT sqrt(value1), sqrt(value2) FROM s3;
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1017.50 rows=1000 width=16)
+   Output: sqrt(value1), sqrt((value2)::double precision)
+   Local server startup cost: 10
+   Remote query: SELECT `value1`, `value2` FROM `mysql_fdw_regress`.`s3`
+(4 rows)
+
+-- select sqrt (buitin function, result)
+--Testcase 10:
+SELECT sqrt(value1), sqrt(value2) FROM s3;
+        sqrt         |        sqrt        
+---------------------+--------------------
+ 0.31622776601683794 |                 10
+  0.4472135954999579 |                 10
+  0.5477225575051661 |                 10
+  1.0488088481701516 | 14.142135623730951
+  1.4832396974191326 | 14.142135623730951
+   1.816590212458495 | 14.142135623730951
+(6 rows)
+
+-- select sqrt (builtin function,, not pushdown constraints, explain)
+--Testcase 11:
+EXPLAIN VERBOSE
+SELECT sqrt(value1), sqrt(value2) FROM s3 WHERE to_hex(value2) != '64';
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1017.50 rows=1000 width=16)
+   Output: sqrt(value1), sqrt((value2)::double precision)
+   Filter: (to_hex(s3.value2) <> '64'::text)
+   Local server startup cost: 10
+   Remote query: SELECT `value1`, `value2` FROM `mysql_fdw_regress`.`s3`
+(5 rows)
+
+-- select sqrt (builtin function, not pushdown constraints, result)
+--Testcase 12:
+SELECT sqrt(value1), sqrt(value2) FROM s3 WHERE to_hex(value2) != '64';
+        sqrt        |        sqrt        
+--------------------+--------------------
+ 1.0488088481701516 | 14.142135623730951
+ 1.4832396974191326 | 14.142135623730951
+  1.816590212458495 | 14.142135623730951
+(3 rows)
+
+-- select sqrt (builtin function, pushdown constraints, explain)
+--Testcase 13:
+EXPLAIN VERBOSE
+SELECT sqrt(value1), sqrt(value2) FROM s3 WHERE value2 != 200;
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1017.50 rows=1000 width=16)
+   Output: sqrt(value1), sqrt((value2)::double precision)
+   Local server startup cost: 10
+   Remote query: SELECT `value1`, `value2` FROM `mysql_fdw_regress`.`s3` WHERE ((`value2` <> 200))
+(4 rows)
+
+-- select sqrt (builtin function, pushdown constraints, result)
+--Testcase 14:
+SELECT sqrt(value1), sqrt(value2) FROM s3 WHERE value2 != 200;
+        sqrt         | sqrt 
+---------------------+------
+ 0.31622776601683794 |   10
+  0.4472135954999579 |   10
+  0.5477225575051661 |   10
+(3 rows)
+
+-- select abs (builtin function, explain)
+--Testcase 15:
+EXPLAIN VERBOSE
+SELECT abs(value1), abs(value2), abs(value3), abs(value4) FROM s3;
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1020.00 rows=1000 width=24)
+   Output: abs(value1), abs(value2), abs(value3), abs(value4)
+   Local server startup cost: 10
+   Remote query: SELECT `value1`, `value2`, `value3`, `value4` FROM `mysql_fdw_regress`.`s3`
+(4 rows)
+
+-- ABS() returns negative values if integer (https://github.com/influxdata/influxdb/issues/10261)
+-- select abs (buitin function, result)
+--Testcase 16:
+SELECT abs(value1), abs(value2), abs(value3), abs(value4) FROM s3;
+ abs | abs | abs | abs 
+-----+-----+-----+-----
+ 0.1 | 100 | 0.1 | 100
+ 0.2 | 100 | 0.2 | 100
+ 0.3 | 100 | 0.3 | 100
+ 1.1 | 200 | 1.1 | 200
+ 2.2 | 200 | 2.2 | 200
+ 3.3 | 200 | 3.3 | 200
+(6 rows)
+
+-- select abs (builtin function, not pushdown constraints, explain)
+--Testcase 17:
+EXPLAIN VERBOSE
+SELECT abs(value1), abs(value2), abs(value3), abs(value4) FROM s3 WHERE to_hex(value2) != '64';
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1020.00 rows=1000 width=24)
+   Output: abs(value1), abs(value2), abs(value3), abs(value4)
+   Filter: (to_hex(s3.value2) <> '64'::text)
+   Local server startup cost: 10
+   Remote query: SELECT `value1`, `value2`, `value3`, `value4` FROM `mysql_fdw_regress`.`s3`
+(5 rows)
+
+-- select abs (builtin function, not pushdown constraints, result)
+--Testcase 18:
+SELECT abs(value1), abs(value2), abs(value3), abs(value4) FROM s3 WHERE to_hex(value2) != '64';
+ abs | abs | abs | abs 
+-----+-----+-----+-----
+ 1.1 | 200 | 1.1 | 200
+ 2.2 | 200 | 2.2 | 200
+ 3.3 | 200 | 3.3 | 200
+(3 rows)
+
+-- select abs (builtin function, pushdown constraints, explain)
+--Testcase 19:
+EXPLAIN VERBOSE
+SELECT abs(value1), abs(value2), abs(value3), abs(value4) FROM s3 WHERE value2 != 200;
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1020.00 rows=1000 width=24)
+   Output: abs(value1), abs(value2), abs(value3), abs(value4)
+   Local server startup cost: 10
+   Remote query: SELECT `value1`, `value2`, `value3`, `value4` FROM `mysql_fdw_regress`.`s3` WHERE ((`value2` <> 200))
+(4 rows)
+
+-- select abs (builtin function, pushdown constraints, result)
+--Testcase 20:
+SELECT abs(value1), abs(value2), abs(value3), abs(value4) FROM s3 WHERE value2 != 200;
+ abs | abs | abs | abs 
+-----+-----+-----+-----
+ 0.1 | 100 | 0.1 | 100
+ 0.2 | 100 | 0.2 | 100
+ 0.3 | 100 | 0.3 | 100
+(3 rows)
+
+-- select log (builtin function, need to swap arguments, numeric cast, explain)
+-- log_<base>(v) : postgresql (base, v), influxdb (v, base), mysql (base, v)
+--Testcase 21:
+EXPLAIN VERBOSE
+SELECT log(value1::numeric, value2::numeric) FROM s3 WHERE value1 != 1;
+                                           QUERY PLAN                                            
+-------------------------------------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1017.50 rows=1000 width=32)
+   Output: log((value1)::numeric, (value2)::numeric)
+   Local server startup cost: 10
+   Remote query: SELECT `value1`, `value2` FROM `mysql_fdw_regress`.`s3` WHERE ((`value1` <> 1))
+(4 rows)
+
+-- select log (builtin function, need to swap arguments, numeric cast, result)
+--Testcase 22:
+SELECT log(value1::numeric, value2::numeric) FROM s3 WHERE value1 != 1;
+         log         
+---------------------
+ -2.0000000000000000
+ -2.8613531161467861
+ -3.8249785787863969
+  55.590256753535330
+  6.7198527566540755
+  4.4377398922117404
+(6 rows)
+
+-- select log (stub function, need to swap arguments, float8, explain)
+--Testcase 23:
+EXPLAIN VERBOSE
+SELECT log(value1, 0.1) FROM s3 WHERE value1 != 1;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1260.00 rows=1000 width=8)
+   Output: log(value1, '0.1'::double precision)
+   Local server startup cost: 10
+   Remote query: SELECT `value1` FROM `mysql_fdw_regress`.`s3` WHERE ((`value1` <> 1))
+(4 rows)
+
+-- select log (stub function, need to swap arguments, float8, result)
+--Testcase 24:
+SELECT log(value1, 0.1) FROM s3 WHERE value1 != 1;
+ERROR:  stub log(float8, float8) is called
+CONTEXT:  PL/pgSQL function log(double precision,double precision) line 3 at RAISE
+-- select log (stub function, need to swap arguments, bigint, explain)
+--Testcase 25:
+EXPLAIN VERBOSE
+SELECT log(value2, 3) FROM s3 WHERE value1 != 1;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1262.50 rows=1000 width=8)
+   Output: log((value2)::double precision, '3'::double precision)
+   Local server startup cost: 10
+   Remote query: SELECT `value2` FROM `mysql_fdw_regress`.`s3` WHERE ((`value1` <> 1))
+(4 rows)
+
+-- select log (stub function, need to swap arguments, bigint, result)
+--Testcase 26:
+SELECT log(value2, 3) FROM s3 WHERE value1 != 1;
+ERROR:  stub log(float8, float8) is called
+CONTEXT:  PL/pgSQL function log(double precision,double precision) line 3 at RAISE
+-- select log (stub function, need to swap arguments, mix type, explain)
+--Testcase 27:
+EXPLAIN VERBOSE
+SELECT log(value1, value2) FROM s3 WHERE value1 != 1;
+                                           QUERY PLAN                                            
+-------------------------------------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1262.50 rows=1000 width=8)
+   Output: log(value1, (value2)::double precision)
+   Local server startup cost: 10
+   Remote query: SELECT `value1`, `value2` FROM `mysql_fdw_regress`.`s3` WHERE ((`value1` <> 1))
+(4 rows)
+
+-- select log (stub function, need to swap arguments, mix type, result)
+--Testcase 28:
+SELECT log(value1, value2) FROM s3 WHERE value1 != 1;
+ERROR:  stub log(float8, float8) is called
+CONTEXT:  PL/pgSQL function log(double precision,double precision) line 3 at RAISE
+-- select log2 (stub function, explain)
+-- EXPLAIN VERBOSE
+-- SELECT log2(value1),log2(value2) FROM s3;
+-- select log2 (stub function, result)
+-- SELECT log2(value1),log2(value2) FROM s3;
+-- select spread (stub agg function, explain)
+-- EXPLAIN VERBOSE
+-- SELECT spread(value1),spread(value2),spread(value3),spread(value4) FROM s3;
+-- select spread (stub agg function, result)
+-- SELECT spread(value1),spread(value2),spread(value3),spread(value4) FROM s3;
+-- select spread (stub agg function, raise exception if not expected type)
+-- SELECT spread(value1::numeric),spread(value2::numeric),spread(value3::numeric),spread(value4::numeric) FROM s3;
+-- select abs as nest function with agg (pushdown, explain)
+--Testcase 29:
+EXPLAIN VERBOSE
+SELECT sum(value3),abs(sum(value3)) FROM s3;
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Aggregate  (cost=1015.00..1015.01 rows=1 width=16)
+   Output: sum(value3), abs(sum(value3))
+   ->  Foreign Scan on public.s3  (cost=10.00..1010.00 rows=1000 width=8)
+         Output: id, tag1, value1, value2, value3, value4, str1, str2
+         Local server startup cost: 10
+         Remote query: SELECT `value3` FROM `mysql_fdw_regress`.`s3`
+(6 rows)
+
+-- select abs as nest function with agg (pushdown, result)
+--Testcase 30:
+SELECT sum(value3),abs(sum(value3)) FROM s3;
+ sum  | abs 
+------+-----
+ -7.2 | 7.2
+(1 row)
+
+-- select abs as nest with log2 (pushdown, explain)
+-- EXPLAIN VERBOSE
+-- SELECT abs(log2(value1)),abs(log2(1/value1)) FROM s3;
+-- select abs as nest with log2 (pushdown, result)
+-- SELECT abs(log2(value1)),abs(log2(1/value1)) FROM s3;
+-- select abs with non pushdown func and explicit constant (explain)
+--Testcase 31:
+EXPLAIN VERBOSE
+SELECT abs(value3), pi(), 4.1 FROM s3;
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1012.50 rows=1000 width=48)
+   Output: abs(value3), '3.141592653589793'::double precision, 4.1
+   Local server startup cost: 10
+   Remote query: SELECT `value3` FROM `mysql_fdw_regress`.`s3`
+(4 rows)
+
+-- select abs with non pushdown func and explicit constant (result)
+--Testcase 32:
+SELECT abs(value3), pi(), 4.1 FROM s3;
+ abs |        pi         | ?column? 
+-----+-------------------+----------
+ 0.1 | 3.141592653589793 |      4.1
+ 0.2 | 3.141592653589793 |      4.1
+ 0.3 | 3.141592653589793 |      4.1
+ 1.1 | 3.141592653589793 |      4.1
+ 2.2 | 3.141592653589793 |      4.1
+ 3.3 | 3.141592653589793 |      4.1
+(6 rows)
+
+-- select sqrt as nest function with agg and explicit constant (pushdown, explain)
+--Testcase 33:
+EXPLAIN VERBOSE
+SELECT sqrt(count(value1)), pi(), 4.1 FROM s3;
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ Aggregate  (cost=1012.50..1012.51 rows=1 width=48)
+   Output: sqrt((count(value1))::double precision), '3.141592653589793'::double precision, 4.1
+   ->  Foreign Scan on public.s3  (cost=10.00..1010.00 rows=1000 width=8)
+         Output: id, tag1, value1, value2, value3, value4, str1, str2
+         Local server startup cost: 10
+         Remote query: SELECT `value1` FROM `mysql_fdw_regress`.`s3`
+(6 rows)
+
+-- select sqrt as nest function with agg and explicit constant (pushdown, result)
+--Testcase 34:
+SELECT sqrt(count(value1)), pi(), 4.1 FROM s3;
+       sqrt        |        pi         | ?column? 
+-------------------+-------------------+----------
+ 2.449489742783178 | 3.141592653589793 |      4.1
+(1 row)
+
+-- select sqrt as nest function with agg and explicit constant and tag (error, explain)
+--Testcase 35:
+EXPLAIN VERBOSE
+SELECT sqrt(count(value1)), pi(), 4.1, tag1 FROM s3;
+ERROR:  column "s3.tag1" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 2: SELECT sqrt(count(value1)), pi(), 4.1, tag1 FROM s3;
+                                               ^
+-- select spread (stub agg function and group by influx_time() and tag) (explain)
+-- EXPLAIN VERBOSE
+-- SELECT spread("value1"),influx_time(time, interval '1s'),tag1 FROM s3 WHERE time >= to_timestamp(0) and time <= to_timestamp(4) GROUP BY influx_time(time, interval '1s'), tag1;
+-- select spread (stub agg function and group by influx_time() and tag) (result)
+-- SELECT spread("value1"),influx_time(time, interval '1s'),tag1 FROM s3 WHERE time >= to_timestamp(0) and time <= to_timestamp(4) GROUP BY influx_time(time, interval '1s'), tag1;
+-- select spread (stub agg function and group by tag only) (result)
+-- SELECT tag1,spread("value1") FROM s3 WHERE time >= to_timestamp(0) and time <= to_timestamp(4) GROUP BY tag1;
+-- select spread (stub agg function and other aggs) (result)
+-- SELECT sum("value1"),spread("value1"),count("value1") FROM s3;
+-- select abs with order by (explain)
+--Testcase 36:
+EXPLAIN VERBOSE
+SELECT value1, abs(1-value1) FROM s3 order by abs(1-value1);
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Sort  (cost=1064.83..1067.33 rows=1000 width=16)
+   Output: value1, (abs(('1'::double precision - value1)))
+   Sort Key: (abs(('1'::double precision - s3.value1)))
+   ->  Foreign Scan on public.s3  (cost=10.00..1015.00 rows=1000 width=16)
+         Output: value1, abs(('1'::double precision - value1))
+         Local server startup cost: 10
+         Remote query: SELECT `value1` FROM `mysql_fdw_regress`.`s3`
+(7 rows)
+
+-- select abs with order by (result)
+--Testcase 37:
+SELECT value1, abs(1-value1) FROM s3 order by abs(1-value1);
+ value1 |         abs         
+--------+---------------------
+    1.1 | 0.10000000000000009
+    0.3 |                 0.7
+    0.2 |                 0.8
+    0.1 |                 0.9
+    2.2 |  1.2000000000000002
+    3.3 |                 2.3
+(6 rows)
+
+-- select abs with order by index (result)
+--Testcase 38:
+SELECT value1, abs(1-value1) FROM s3 order by 2,1;
+ value1 |         abs         
+--------+---------------------
+    1.1 | 0.10000000000000009
+    0.3 |                 0.7
+    0.2 |                 0.8
+    0.1 |                 0.9
+    2.2 |  1.2000000000000002
+    3.3 |                 2.3
+(6 rows)
+
+-- select abs with order by index (result)
+--Testcase 39:
+SELECT value1, abs(1-value1) FROM s3 order by 1,2;
+ value1 |         abs         
+--------+---------------------
+    0.1 |                 0.9
+    0.2 |                 0.8
+    0.3 |                 0.7
+    1.1 | 0.10000000000000009
+    2.2 |  1.2000000000000002
+    3.3 |                 2.3
+(6 rows)
+
+-- select abs and as
+--Testcase 40:
+SELECT abs(value3) as abs1 FROM s3;
+ abs1 
+------
+  0.1
+  0.2
+  0.3
+  1.1
+  2.2
+  3.3
+(6 rows)
+
+-- select spread over join query (explain)
+-- EXPLAIN VERBOSE
+-- SELECT spread(t1.value1), spread(t2.value1) FROM s3 t1 INNER JOIN s3 t2 ON (t1.value1 = t2.value1) where t1.value1 = 0.1;
+-- select spread over join query (result, stub call error)
+-- SELECT spread(t1.value1), spread(t2.value1) FROM s3 t1 INNER JOIN s3 t2 ON (t1.value1 = t2.value1) where t1.value1 = 0.1;
+-- select spread with having (explain)
+-- EXPLAIN VERBOSE
+-- SELECT spread(value1) FROM s3 HAVING spread(value1) > 100;
+-- select spread with having (explain, cannot pushdown, stub call error)
+-- SELECT spread(value1) FROM s3 HAVING spread(value1) > 100;
+-- select abs with arithmetic and tag in the middle (explain)
+--Testcase 41:
+EXPLAIN VERBOSE
+SELECT abs(value1) + 1, value2, tag1, sqrt(value2) FROM s3;
+                                           QUERY PLAN                                            
+-------------------------------------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1020.00 rows=1000 width=52)
+   Output: (abs(value1) + '1'::double precision), value2, tag1, sqrt((value2)::double precision)
+   Local server startup cost: 10
+   Remote query: SELECT `tag1`, `value1`, `value2` FROM `mysql_fdw_regress`.`s3`
+(4 rows)
+
+-- select abs with arithmetic and tag in the middle (result)
+--Testcase 42:
+SELECT abs(value1) + 1, value2, tag1, sqrt(value2) FROM s3;
+ ?column? | value2 | tag1 |        sqrt        
+----------+--------+------+--------------------
+      1.1 |    100 | a    |                 10
+      1.2 |    100 | a    |                 10
+      1.3 |    100 | a    |                 10
+      2.1 |    200 | b    | 14.142135623730951
+      3.2 |    200 | b    | 14.142135623730951
+      4.3 |    200 | b    | 14.142135623730951
+(6 rows)
+
+-- select with order by limit (explain)
+--Testcase 43:
+EXPLAIN VERBOSE
+SELECT abs(value1), abs(value3), sqrt(value2) FROM s3 ORDER BY abs(value3) LIMIT 1;
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ Limit  (cost=1025.00..1025.00 rows=1 width=24)
+   Output: (abs(value1)), (abs(value3)), (sqrt((value2)::double precision))
+   ->  Sort  (cost=1025.00..1027.50 rows=1000 width=24)
+         Output: (abs(value1)), (abs(value3)), (sqrt((value2)::double precision))
+         Sort Key: (abs(s3.value3))
+         ->  Foreign Scan on public.s3  (cost=10.00..1020.00 rows=1000 width=24)
+               Output: abs(value1), abs(value3), sqrt((value2)::double precision)
+               Local server startup cost: 10
+               Remote query: SELECT `value1`, `value2`, `value3` FROM `mysql_fdw_regress`.`s3`
+(9 rows)
+
+-- select with order by limit (explain)
+--Testcase 44:
+SELECT abs(value1), abs(value3), sqrt(value2) FROM s3 ORDER BY abs(value3) LIMIT 1;
+ abs | abs | sqrt 
+-----+-----+------
+ 0.1 | 0.1 |   10
+(1 row)
+
+-- select mixing with non pushdown func (all not pushdown, explain)
+--Testcase 45:
+EXPLAIN VERBOSE
+SELECT abs(value1), sqrt(value2), chr(id+40) FROM s3;
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Foreign Scan on public.s3  (cost=10.00..1022.50 rows=1000 width=48)
+   Output: abs(value1), sqrt((value2)::double precision), chr((id + 40))
+   Local server startup cost: 10
+   Remote query: SELECT `id`, `value1`, `value2` FROM `mysql_fdw_regress`.`s3`
+(4 rows)
+
+-- select mixing with non pushdown func (result)
+--Testcase 46:
+SELECT abs(value1), sqrt(value2), chr(id+40) FROM s3;
+ abs |        sqrt        | chr 
+-----+--------------------+-----
+ 0.1 |                 10 | (
+ 0.2 |                 10 | )
+ 0.3 |                 10 | *
+ 1.1 | 14.142135623730951 | +
+ 2.2 | 14.142135623730951 | ,
+ 3.3 | 14.142135623730951 | -
+(6 rows)
+
+--Testcase 47:
+DROP FOREIGN TABLE s3;
+-- full text search table
+--Testcase 48:
+CREATE FOREIGN TABLE ftextsearch(id int, content text) SERVER server1 OPTIONS(dbname 'mysql_fdw_regress', table_name 'ftextsearch');
+-- text search (pushdown, explain)
+--Testcase 49:
+EXPLAIN VERBOSE
+SELECT MATCH_AGAINST(ARRAY[content, 'success catches']) AS score, content FROM ftextsearch WHERE MATCH_AGAINST(ARRAY[content, 'success catches','IN BOOLEAN MODE']) != 0;
+                                                                      QUERY PLAN                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on public.ftextsearch  (cost=10.00..1260.00 rows=1000 width=40)
+   Output: match_against(ARRAY[content, 'success catches'::text]), content
+   Local server startup cost: 10
+   Remote query: SELECT `content` FROM `mysql_fdw_regress`.`ftextsearch` WHERE ((MATCH (`content`) AGAINST ( 'success catches' IN BOOLEAN MODE) <> 0))
+(4 rows)
+
+-- text search (pushdown, result)
+--Testcase 50:
+SELECT content FROM (
+SELECT MATCH_AGAINST(ARRAY[content, 'success catches']) AS score, content FROM ftextsearch WHERE MATCH_AGAINST(ARRAY[content, 'success catches','IN BOOLEAN MODE']) != 0
+       ) AS t;
+             content              
+----------------------------------
+ Failure teaches success.
+ The early bird catches the worm.
+(2 rows)
+
+--Testcase 51:
+DROP FOREIGN TABLE ftextsearch;
+--Testcase 52:
+DROP USER MAPPING FOR CURRENT_USER SERVER server1;
+--Testcase 53:
+DROP SERVER server1;
+--Testcase 54:
+DROP EXTENSION mysql_fdw;

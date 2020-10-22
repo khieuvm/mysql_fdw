@@ -45,6 +45,7 @@
 #else
 #include "optimizer/optimizer.h"
 #endif
+#include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "storage/ipc.h"
 #include "utils/builtins.h"
@@ -116,6 +117,8 @@ typedef struct MySQLFdwRelationInfo
 	/* Bitmap of attr numbers we need to fetch from the remote server. */
 	Bitmapset  *attrs_used;
 
+	/* Function pushdown surppot in target list */
+	bool		is_tlist_func_pushdown;
 } MySQLFdwRelationInfo;
 
 extern PGDLLEXPORT void _PG_init(void);
@@ -445,6 +448,7 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	ForeignTable *table;
 	char		timeout[255];
 	int			numParams;
+	int               rtindex;
 
 	/*
 	 * We'll save private state in node->fdw_state.
@@ -456,17 +460,20 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	 * Identify which user to do the remote access as.  This should match what
 	 * ExecCheckRTEPerms() does.
 	 */
-	rte = rt_fetch(fsplan->scan.scanrelid, estate->es_range_table);
+	if (fsplan->scan.scanrelid > 0)
+		rtindex = fsplan->scan.scanrelid;
+	else
+		rtindex = bms_next_member(fsplan->fs_relids, -1);
+	rte = exec_rt_fetch(rtindex, estate);
 	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
 
 	/* Get info about foreign table. */
-	festate->rel = node->ss.ss_currentRelation;
-	table = GetForeignTable(RelationGetRelid(festate->rel));
+	table = GetForeignTable(rte->relid);
 	server = GetForeignServer(table->serverid);
 	user = GetUserMapping(userid, server->serverid);
 
 	/* Fetch the options */
-	options = mysql_get_options(RelationGetRelid(node->ss.ss_currentRelation));
+	options = mysql_get_options(rte->relid);
 
 	/*
 	 * Get the already connected connection, otherwise connect and get the
@@ -720,9 +727,19 @@ mysqlExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
 	MySQLFdwExecState *festate = (MySQLFdwExecState *) node->fdw_state;
 	mysql_opt  *options;
+	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+	int rtindex;
+	RangeTblEntry *rte;
+	EState *estate = node->ss.ps.state;
+
+	if (fsplan->scan.scanrelid > 0)
+		rtindex = fsplan->scan.scanrelid;
+	else
+		rtindex = bms_next_member(fsplan->fs_relids, -1);
+	rte = exec_rt_fetch(rtindex, estate);
 
 	/* Fetch options */
-	options = mysql_get_options(RelationGetRelid(node->ss.ss_currentRelation));
+	options = mysql_get_options(rte->relid);
 
 	/* Give some possibly useful info about startup costs */
 	if (es->verbose)
@@ -864,7 +881,7 @@ mysqlGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 		appendStringInfo(&sql, "EXPLAIN ");
 
 		mysql_deparse_select(&sql, root, baserel, fpinfo->attrs_used,
-							 options->svr_table, &retrieved_attrs);
+							 options->svr_table, &retrieved_attrs, NULL);
 
 		if (fpinfo->remote_conds)
 			mysql_append_where_clause(&sql, root, baserel,
@@ -1047,6 +1064,7 @@ mysqlGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel,
 	List	   *local_exprs = NIL;
 	List	   *remote_exprs = NIL;
 	List	   *params_list = NIL;
+	List       *fdw_scan_tlist = NIL;
 	List	   *remote_conds = NIL;
 	StringInfoData sql;
 	mysql_opt  *options;
@@ -1055,6 +1073,9 @@ mysqlGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel,
 
 	/* Fetch options */
 	options = mysql_get_options(foreigntableid);
+
+	/* Decide to execute function pushdown support in the target list. */
+	fpinfo->is_tlist_func_pushdown = mysql_is_foreign_function_tlist(root, foreignrel, tlist);
 
 	/*
 	 * Build the query string to be sent for execution, and identify
@@ -1109,8 +1130,27 @@ mysqlGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel,
 			local_exprs = lappend(local_exprs, rinfo->clause);
 	}
 
+	if (fpinfo->is_tlist_func_pushdown == true)
+	{
+		/*
+		 * Join relation or upper relation - set scan_relid to 0.
+		 */
+		scan_relid = 0;
+		
+		fdw_scan_tlist = copyObject(tlist);
+		foreach(lc, fpinfo->local_conds)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+			fdw_scan_tlist = add_to_flat_tlist(fdw_scan_tlist,
+											   pull_var_clause((Node *) rinfo->clause,
+															   PVC_RECURSE_PLACEHOLDERS));
+		}
+	}
+
+	/* Cannot compile this code for plain PostgreSQL, which doesn't have is_tlist_pushdown member */
 	mysql_deparse_select(&sql, root, foreignrel, fpinfo->attrs_used,
-						 options->svr_table, &retrieved_attrs);
+						 options->svr_table, &retrieved_attrs, fdw_scan_tlist);
 
 	if (remote_conds)
 		mysql_append_where_clause(&sql, root, foreignrel, remote_conds,
@@ -1129,7 +1169,7 @@ mysqlGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel,
 	 * Items in the list must match enum FdwScanPrivateIndex, above.
 	 */
 
-	fdw_private = list_make2(makeString(sql.data), retrieved_attrs);
+	fdw_private = list_make3(makeString(sql.data), retrieved_attrs, fdw_scan_tlist);
 
 	/*
 	 * Create the ForeignScan node from target list, local filtering
@@ -1141,7 +1181,7 @@ mysqlGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel,
 	 */
 #if PG_VERSION_NUM >= 90500
 	return make_foreignscan(tlist, local_exprs, scan_relid, params_list,
-							fdw_private, NIL, NIL, outer_plan);
+							fdw_private, fdw_scan_tlist, NIL, outer_plan);
 #else
 	return make_foreignscan(tlist, local_exprs, scan_relid, params_list,
 							fdw_private);
