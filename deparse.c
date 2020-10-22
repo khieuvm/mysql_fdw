@@ -43,6 +43,7 @@
 #define IS_INTEGER_TYPE(typid) ((typid == INT2OID) || (typid == INT4OID) || (typid == INT8OID))
 
 static char *mysql_quote_identifier(const char *str, char quotechar);
+static bool mysql_contain_immutable_functions_walker(Node *node, void *context);
 
 /*
  * Global context for foreign_expr_walker's search of an expression tree.
@@ -68,6 +69,7 @@ typedef struct foreign_loc_cxt
 {
 	Oid			collation;		/* OID of current collation, if any */
 	FDWCollateState state;		/* state of current collation choice */
+	bool        can_skip_cast;  /* outer function can skip float cast */
 } foreign_loc_cxt;
 
 /*
@@ -79,6 +81,7 @@ typedef struct deparse_expr_cxt
 	RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
 	StringInfo	buf;			/* output buffer to append to */
 	List	  **params_list;	/* exprs that will become remote Params */
+	int         can_skip_cast;  /* outer function can skip float8/numeric cast */
 } deparse_expr_cxt;
 
 
@@ -118,7 +121,8 @@ static void mysql_deparse_relation(StringInfo buf, Relation rel);
 static void mysql_deparse_target_list(StringInfo buf, PlannerInfo *root,
 									  Index rtindex, Relation rel,
 									  Bitmapset *attrs_used,
-									  List **retrieved_attrs);
+									  List **retrieved_attrs,
+									  List *tlist, RelOptInfo *baserel);
 static void mysql_deparse_column_ref(StringInfo buf, int varno, int varattno,
 									 PlannerInfo *root);
 static bool mysql_deparse_op_divide(Expr *node, deparse_expr_cxt *context);
@@ -201,7 +205,7 @@ mysql_quote_identifier(const char *str, char quotechar)
 void
 mysql_deparse_select(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel,
 					 Bitmapset *attrs_used, char *svr_table,
-					 List **retrieved_attrs)
+					 List **retrieved_attrs, List *tlist)
 {
 	RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
 	Relation	rel;
@@ -218,7 +222,7 @@ mysql_deparse_select(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel,
 
 	appendStringInfoString(buf, "SELECT ");
 	mysql_deparse_target_list(buf, root, baserel->relid, rel, attrs_used,
-							  retrieved_attrs);
+							  retrieved_attrs, tlist, baserel);
 
 	/*
 	 * Construct FROM clause
@@ -305,40 +309,78 @@ mysql_deparse_analyze(StringInfo sql, char *dbname, char *relname)
 static void
 mysql_deparse_target_list(StringInfo buf, PlannerInfo *root, Index rtindex,
 						  Relation rel, Bitmapset *attrs_used,
-						  List **retrieved_attrs)
+						  List **retrieved_attrs,
+						  List *tlist,
+						  RelOptInfo *baserel)
 {
-	TupleDesc	tupdesc = RelationGetDescr(rel);
-	bool		have_wholerow;
 	bool		first;
-	int			i;
-
-	/* If there's a whole-row reference, we'll need all the columns. */
-	have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
-								  attrs_used);
 
 	first = true;
 
 	*retrieved_attrs = NIL;
-	for (i = 1; i <= tupdesc->natts; i++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
 
-		/* Ignore dropped attributes. */
-		if (attr->attisdropped)
-			continue;
+	if (baserel->reloptkind == RELOPT_JOINREL ||
+		tlist != NULL ||
+		baserel->reloptkind == RELOPT_UPPER_REL)
+ 	{
+		/* Pushdown target list */
 
-		if (have_wholerow ||
-			bms_is_member(i - FirstLowInvalidHeapAttributeNumber, attrs_used))
+		ListCell *cell;
+		int i = 0;
+
+		/* Set up context struct for recursion */
+		deparse_expr_cxt context;
+		context.root = root;
+		context.foreignrel = baserel;
+		context.buf = buf;
+		context.params_list = NULL;
+		context.can_skip_cast = false;
+		foreach (cell, tlist)
 		{
+			Expr *expr = ((TargetEntry *)lfirst(cell))->expr;
+
 			if (!first)
 				appendStringInfoString(buf, ", ");
 			first = false;
 
-			mysql_deparse_column_ref(buf, rtindex, i, root);
-			*retrieved_attrs = lappend_int(*retrieved_attrs, i);
+			/* Deparse target list for push down */
+			deparseExpr(expr, &context);
+			*retrieved_attrs = lappend_int(*retrieved_attrs, i + 1);
+			i++;
 		}
 	}
+	else
+	{
+		TupleDesc	tupdesc = RelationGetDescr(rel);
+		int			i;
+		bool		have_wholerow;
 
+		/* If there's a whole-row reference, we'll need all the columns. */
+		have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
+									  attrs_used);
+
+		/* Not pushdown target list */
+		for (i = 1; i <= tupdesc->natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
+
+			/* Ignore dropped attributes. */
+			if (attr->attisdropped)
+				continue;
+
+			if (have_wholerow ||
+				bms_is_member(i - FirstLowInvalidHeapAttributeNumber,
+							  attrs_used))
+			{
+				if (!first)
+					appendStringInfoString(buf, ", ");
+				first = false;
+
+				mysql_deparse_column_ref(buf, rtindex, i, root);
+				*retrieved_attrs = lappend_int(*retrieved_attrs, i);
+			}
+		}
+	}
 	/* Don't generate bad syntax if no undropped columns */
 	if (first)
 		appendStringInfoString(buf, "NULL");
@@ -374,6 +416,7 @@ mysql_append_where_clause(StringInfo buf, PlannerInfo *root,
 	context.foreignrel = baserel;
 	context.buf = buf;
 	context.params_list = params;
+	context.can_skip_cast = false;
 
 	foreach(lc, exprs)
 	{
@@ -510,8 +553,12 @@ mysql_deparse_string_literal(StringInfo buf, const char *val)
 static void
 deparseExpr(Expr *node, deparse_expr_cxt *context)
 {
+	bool outer_can_skip_cast = context->can_skip_cast;
+
 	if (node == NULL)
 		return;
+
+	context->can_skip_cast = false;
 
 	switch (nodeTag(node))
 	{
@@ -533,6 +580,7 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 #endif
 			break;
 		case T_FuncExpr:
+			context->can_skip_cast = outer_can_skip_cast;
 			mysql_deparse_func_expr((FuncExpr *) node, context);
 			break;
 		case T_OpExpr:
@@ -922,6 +970,7 @@ mysql_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 	const char *proname;
 	bool		first;
 	ListCell   *arg;
+	bool        can_skip_cast = false;
 
 	/*
 	 * If the function call came from an implicit coercion, then just show the
@@ -956,6 +1005,10 @@ mysql_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 		    ArrayExpr *anode;
 			bool swt_arg;
 			node = lfirst(arg);
+			if (IsA(node, ArrayCoerceExpr))
+			{
+				node = (Expr *)((ArrayCoerceExpr *)node)->arg;
+			}
 			Assert(nodeTag(node)==T_ArrayExpr);
 			anode = (ArrayExpr *)node;
 			appendStringInfoString(buf, "MATCH (");
@@ -1000,24 +1053,44 @@ mysql_deparse_func_expr(FuncExpr *node, deparse_expr_cxt *context)
 			}
 			appendStringInfoChar(buf, ')');
 		}
-	}
-	else
-	{
-		/* Deparse the function name ... */
-		appendStringInfo(buf, "%s(", proname);
-		/* ... and all the arguments */
-		first = true;
-		foreach(arg, node->args)
-		{
-			if (!first)
-				appendStringInfoString(buf, ", ");
-			deparseExpr((Expr *) lfirst(arg), context);
-			first = false;
-		}
-		appendStringInfoChar(buf, ')');
+		ReleaseSysCache(proctup);
+
+		return;
 	}
 
+	/* remove cast function if parent function is can handle without cast */
+	if (context->can_skip_cast == true &&
+		(strcmp(NameStr(procform->proname), "float8") == 0 || strcmp(NameStr(procform->proname), "numeric") == 0))
+	{
+		ReleaseSysCache(proctup);
+		arg = list_head(node->args);
+		context->can_skip_cast = false;
+		deparseExpr((Expr *) lfirst(arg), context);
+		return;
+	}
+
+	/* inner function can skip cast if any */
+	if (strcmp(NameStr(procform->proname), "sqrt") == 0 || strcmp(NameStr(procform->proname), "log") == 0)
+		can_skip_cast = true;
+
+	/* Deparse the function name ... */
+	appendStringInfo(buf, "%s(", proname);
+
 	ReleaseSysCache(proctup);
+
+	/* ... and all the arguments */
+	first = true;
+	foreach(arg, node->args)
+	{
+		if (!first)
+			appendStringInfoString(buf, ", ");
+
+		if (can_skip_cast)
+			context->can_skip_cast = true;
+		deparseExpr((Expr *) lfirst(arg), context);
+		first = false;
+	}
+	appendStringInfoChar(buf, ')');
 }
 
 /*
@@ -1509,6 +1582,7 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 	/* Set up inner_cxt for possible recursion to child nodes */
 	inner_cxt.collation = InvalidOid;
 	inner_cxt.state = FDW_COLLATE_NONE;
+	inner_cxt.can_skip_cast = false;
 
 	switch (nodeTag(node))
 	{
@@ -1623,6 +1697,7 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 			{
 				FuncExpr   *fe = (FuncExpr *) node;
 				char	   *opername = NULL;
+				Node       *node_arg = (Node *)fe->args;
 
 				/*
 				 * If function used by the expression is not built-in, it
@@ -1638,13 +1713,40 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 				ReleaseSysCache(tuple);
 
 				/* pushed down to mysql */
-				if (!is_builtin(fe->funcid) && strcmp(opername, "match_against") != 0)
+				if (!is_builtin(fe->funcid) &&
+					strcmp(opername, "float8") != 0 &&
+					strcmp(opername, "numeric") != 0 &&
+					strcmp(opername, "log") != 0 &&
+					strcmp(opername, "match_against") != 0)
 					return false;
+
+				/* inner function can skip float cast if any */
+				if (strcmp(opername, "sqrt") == 0 || strcmp(opername, "log") == 0)
+					inner_cxt.can_skip_cast = true;
+
+				/* Accept type cast functions if outer is specific functions */
+				if (strcmp(opername, "float8") == 0 || strcmp(opername, "numeric") == 0)
+				{
+					if (outer_cxt->can_skip_cast == false)
+						return false;
+				}
+
+				if (strcmp(opername, "match_against") == 0 && IsA(node_arg, List))
+				{
+					List	   *l = (List *) node_arg;
+					ListCell   *lc = list_head(l);
+
+					node_arg = (Node *)lfirst(lc);
+					if (IsA(node_arg, ArrayCoerceExpr))
+					{
+						node_arg = (Node *)((ArrayCoerceExpr *)node_arg)->arg;
+					}
+				}
 
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				if (!foreign_expr_walker((Node *) fe->args,
+				if (!foreign_expr_walker((Node *) node_arg,
 										 glob_cxt, &inner_cxt))
 					return false;
 
@@ -1834,6 +1936,9 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 				List	   *l = (List *) node;
 				ListCell   *lc;
 
+				/* inherit can_skip_cast flag */
+				inner_cxt.can_skip_cast = outer_cxt->can_skip_cast;
+
 				/*
 				 * Recurse to component subexpressions.
 				 */
@@ -1937,6 +2042,7 @@ mysql_is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr *expr)
 	glob_cxt.foreignrel = baserel;
 	loc_cxt.collation = InvalidOid;
 	loc_cxt.state = FDW_COLLATE_NONE;
+	loc_cxt.can_skip_cast = false;
 	if (!foreign_expr_walker((Node *) expr, &glob_cxt, &loc_cxt))
 		return false;
 
@@ -1945,5 +2051,132 @@ mysql_is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr *expr)
 	Assert(loc_cxt.state == FDW_COLLATE_NONE);
 
 	/* OK to evaluate on the remote server */
+	return true;
+}
+
+/*****************************************************************************
+ *		Check clauses for immutable functions
+ *****************************************************************************/
+
+/*
+ * contain_immutable_functions
+ *	  Recursively search for immutable functions within a clause.
+ *
+ * Returns true if any immutable function (or operator implemented by a
+ * immutable function) is found.
+ *
+ * We will recursively look into TargetEntry exprs.
+ */
+static bool
+mysql_contain_immutable_functions(Node *clause)
+{
+	return mysql_contain_immutable_functions_walker(clause, NULL);
+}
+
+static bool
+mysql_contain_immutable_functions_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	/* Check for mutable functions in node itself */
+	if (nodeTag(node) == T_FuncExpr)
+	{
+		FuncExpr *expr = (FuncExpr *) node;
+		if (func_volatile(expr->funcid) == PROVOLATILE_IMMUTABLE)
+			return true;
+	}
+
+	/*
+	 * It should be safe to treat MinMaxExpr as immutable, because it will
+	 * depend on a non-cross-type btree comparison function, and those should
+	 * always be immutable.  Treating XmlExpr as immutable is more dubious,
+	 * and treating CoerceToDomain as immutable is outright dangerous.  But we
+	 * have done so historically, and changing this would probably cause more
+	 * problems than it would fix.  In practice, if you have a non-immutable
+	 * domain constraint you are in for pain anyhow.
+	 */
+
+	/* Recurse to check arguments */
+	if (IsA(node, Query))
+	{
+		/* Recurse into subselects */
+		return query_tree_walker((Query *) node,
+								 mysql_contain_immutable_functions_walker,
+								 context, 0);
+	}
+	return expression_tree_walker(node, mysql_contain_immutable_functions_walker,
+								  context);
+}
+
+/*
+ * Returns true if given tlist is safe to evaluate on the foreign server.
+ */
+bool mysql_is_foreign_function_tlist(PlannerInfo *root,
+									 RelOptInfo *baserel,
+									 List *tlist)
+{
+	foreign_glob_cxt glob_cxt;
+	foreign_loc_cxt  loc_cxt;
+	ListCell        *lc;
+	bool             is_contain_function;
+
+	if (!(baserel->reloptkind == RELOPT_BASEREL ||
+		  baserel->reloptkind == RELOPT_OTHER_MEMBER_REL))
+		return false;
+
+	/*
+	 * Check that the expression consists of any immutable function.
+	 */
+	is_contain_function = false;
+	foreach(lc, tlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (mysql_contain_immutable_functions((Node *) tle->expr))
+		{
+			is_contain_function = true;
+			break;
+		}
+	}
+
+	if (!is_contain_function)
+		return false;
+
+	/*
+	 * Check that the expression consists of nodes that are safe to execute
+	 * remotely.
+	 */
+	foreach(lc, tlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		glob_cxt.root = root;
+		glob_cxt.foreignrel = baserel;
+		loc_cxt.collation = InvalidOid;
+		loc_cxt.state = FDW_COLLATE_NONE;
+		loc_cxt.can_skip_cast = false;
+
+		if (!foreign_expr_walker((Node *) tle->expr, &glob_cxt, &loc_cxt))
+			return false;
+
+		/*
+		 * If the expression has a valid collation that does not arise from a
+		 * foreign var, the expression can not be sent over.
+		 */
+		if (loc_cxt.state == FDW_COLLATE_UNSAFE)
+			return false;
+
+		/*
+		 * An expression which includes any mutable functions can't be sent over
+		 * because its result is not stable.  For example, sending now() remote
+		 * side could cause confusion from clock offsets.  Future versions might
+		 * be able to make this choice with more granularity.  (We check this last
+		 * because it requires a lot of expensive catalog lookups.)
+		 */
+		if (contain_mutable_functions((Node *) tle->expr))
+			return false;
+	}
+
+	/* OK for the target list with functions to evaluate on the remote server */
 	return true;
 }

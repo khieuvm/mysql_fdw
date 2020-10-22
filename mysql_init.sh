@@ -40,3 +40,20 @@ mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress1 -e
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress1 -e "CREATE TABLE numbers (a int, b varchar(255));"
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "CREATE TABLE enum_t1 (id int PRIMARY KEY, size ENUM('small', 'medium', 'large'));"
 mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO enum_t1 VALUES (1, 'small'),(2, 'medium'),(3, 'medium');"
+
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "DROP TABLE IF EXISTS s3;"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -D $MYSQL_PORT -D mysql_fdw_regress -e "CREATE TABLE s3(id int PRIMARY KEY, tag1 text, value1 float, value2 int, value3 float, value4 int, str1 text, str2 text);"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -D $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO s3 VALUES (0, 'a', 0.1, 100, -0.1, -100, '---XYZ---', '   XYZ   ');"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -D $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO s3 VALUES (1, 'a', 0.2, 100, -0.2, -100, '---XYZ---', '   XYZ   ');"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -D $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO s3 VALUES (2, 'a', 0.3, 100, -0.3, -100, '---XYZ---', '   XYZ   ');"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -D $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO s3 VALUES (3, 'b', 1.1, 200, -1.1, -200, '---XYZ---', '   XYZ   ');"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -D $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO s3 VALUES (4, 'b', 2.2, 200, -2.2, -200, '---XYZ---', '   XYZ   ');"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -D $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO s3 VALUES (5, 'b', 3.3, 200, -3.3, -200, '---XYZ---', '   XYZ   ');"
+
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -P $MYSQL_PORT -D mysql_fdw_regress -e "DROP TABLE IF EXISTS ftextsearch;"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -D $MYSQL_PORT -D mysql_fdw_regress -e "CREATE TABLE ftextsearch(id int UNSIGNED AUTO_INCREMENT NOT NULL PRIMARY KEY, content TEXT, FULLTEXT (content));"
+
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -D $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO ftextsearch (content) VALUES ('So many men, so many minds.');"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -D $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO ftextsearch (content) VALUES ('Failure teaches success.');"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -D $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO ftextsearch (content) VALUES ('It is no use cring over spilt mik.');"
+mysql -h $MYSQL_HOST -u $MYSQL_USER_NAME -D $MYSQL_PORT -D mysql_fdw_regress -e "INSERT INTO ftextsearch (content) VALUES ('The early bird catches the worm.');"
