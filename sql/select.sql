@@ -323,66 +323,90 @@ SELECT * FROM f_mysql_test t1 LEFT JOIN LATERAL (
 --Testcase 122:
 SELECT * FROM f_mysql_test t1 LEFT JOIN LATERAL (
   SELECT t2.a, t1.a AS t1_a FROM f_mysql_test t2) t3 ON t1.a = t3.a ORDER BY 1;
+--Testcase 141:
 SELECT t1.c1, t3.c1, t3.t1_c8 FROM f_test_tbl1 t1 INNER JOIN LATERAL (
   SELECT t2.c1, t1.c8 AS t1_c8 FROM f_test_tbl2 t2) t3 ON t3.c1 = t3.t1_c8
   ORDER BY 1, 2, 3;
+--Testcase 142:
 SELECT t1.c1, t3.c1, t3.t1_c8 FROM l_test_tbl1 t1 LEFT JOIN LATERAL (
   SELECT t2.c1, t1.c8 AS t1_c8 FROM f_test_tbl2 t2) t3 ON t3.c1 = t3.t1_c8
   ORDER BY 1, 2, 3;
+--Testcase 143:
 SELECT *, (SELECT r FROM (SELECT c1 AS c1) x, LATERAL (SELECT c1 AS r) y)
   FROM f_test_tbl1 ORDER BY 1, 2, 3;
 -- LATERAL JOIN with RIGHT should throw error
+--Testcase 144:
 SELECT t1.c1, t3.c1, t3.t1_c8 FROM f_test_tbl1 t1 RIGHT JOIN LATERAL (
   SELECT t2.c1, t1.c8 AS t1_c8 FROM f_test_tbl2 t2) t3 ON t3.c1 = t3.t1_c8
   ORDER BY 1, 2, 3;
 
 -- FDW-207: NATURAL JOIN should give correct output
+--Testcase 145:
 SELECT t1.c1, t2.c1, t3.c1
   FROM f_test_tbl1 t1 NATURAL JOIN f_test_tbl1 t2 NATURAL JOIN f_test_tbl1 t3
   ORDER BY 1, 2, 3;
 
 -- FDW-208: IS NULL and LIKE should give the correct output with
 -- use_remote_estimate set to true.
+--Testcase 146:
 INSERT INTO f_test_tbl2 VALUES (50, 'TEMP1', NULL);
+--Testcase 147:
 INSERT INTO f_test_tbl2 VALUES (60, 'TEMP2', NULL);
 ALTER SERVER mysql_svr OPTIONS (use_remote_estimate 'true');
+--Testcase 148:
 SELECT t1.c1, t2.c1
   FROM f_test_tbl2 t1 INNER JOIN f_test_tbl2 t2 ON t1.c1 = t2.c1
   WHERE t1.c3 IS NULL ORDER BY 1, 2;
+--Testcase 149:
 SELECT t1.c1, t2.c1
   FROM f_test_tbl2 t1 INNER JOIN f_test_tbl2 t2 ON t1.c1 = t2.c1 AND t1.c2 LIKE 'TEMP%'
   ORDER BY 1, 2;
+--Testcase 150:
 DELETE FROM f_test_tbl2 WHERE c1 IN (50, 60);
 ALTER SERVER mysql_svr OPTIONS (SET use_remote_estimate 'false');
 
 -- FDW-169: Insert/Update/Delete on enum column.
+--Testcase 151:
 INSERT INTO f_enum_t1
   VALUES (1, 'small'), (2, 'medium'), (3, 'medium'), (4, 'small');
+--Testcase 152:
 SELECT * FROM f_enum_t1 WHERE id = 4;
+--Testcase 153:
 UPDATE f_enum_t1 SET size = 'large' WHERE id = 4;
+--Testcase 154:
 SELECT * FROM f_enum_t1 WHERE id = 4;
+--Testcase 155:
 DELETE FROM f_enum_t1 WHERE size = 'large';
+--Testcase 156:
 SELECT * FROM f_enum_t1 WHERE id = 4;
 
 -- Negative scenarios for ENUM handling.
 -- Test that if we insert the ENUM value which is not present on MySQL side,
 -- but present on Postgres side.
+--Testcase 157:
 DROP FOREIGN TABLE f_enum_t1;
+--Testcase 158:
 DROP TYPE size_t;
 -- Create the type with extra enum values.
+--Testcase 159:
 CREATE TYPE size_t AS enum('small', 'medium', 'large', 'largest', '');
+--Testcase 160:
 CREATE FOREIGN TABLE f_enum_t1(id int, size size_t)
   SERVER mysql_svr OPTIONS (dbname 'mysql_fdw_regress', table_name 'enum_t1');
 
 -- If we insert the enum value which is not present on MySQL side then it
 -- inserts empty string in ANSI_QUOTES sql_mode, so verify that.
+--Testcase 161:
 INSERT INTO f_enum_t1 VALUES (4, 'largest');
+--Testcase 162:
 SELECT * from f_enum_t1;
+--Testcase 163:
 DELETE FROM f_enum_t1 WHERE size = '';
 
 -- Postgres should throw an error as the value which we are inserting for enum
 -- column is not present in enum on Postgres side, no matter whether it is
 -- present on MySQL side or not. PG's sanity check itself throws an error.
+--Testcase 164:
 INSERT INTO f_enum_t1 VALUES (4, 'big');
 
 -- FDW-155: Enum data type can be handled correctly in select statements on
@@ -454,17 +478,21 @@ SELECT c1, c2 FROM f_test_tbl2 WHERE c3 = (SELECT 'PUNE'::varchar) ORDER BY c1;
 SELECT * FROM local_t1 lt1 WHERE lt1.c1 =
   (SELECT count(*) FROM f_test_tbl3 ft1 WHERE ft1.c2 = lt1.c2) ORDER BY lt1.c1;
 
+--Testcase 165:
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT c1, c2 FROM f_test_tbl1 WHERE c8 = (
   SELECT c1 FROM f_test_tbl2 WHERE c1 = (
     SELECT min(c1) + 1 FROM f_test_tbl2)) ORDER BY c1;
+--Testcase 166:
 SELECT c1, c2 FROM f_test_tbl1 WHERE c8 = (
   SELECT c1 FROM f_test_tbl2 WHERE c1 = (
     SELECT min(c1) + 1 FROM f_test_tbl2)) ORDER BY c1;
 
+--Testcase 167:
 SELECT * FROM f_test_tbl1 WHERE c1 = (SELECT 500) AND c2 = (
   SELECT max(c2) FROM f_test_tbl1 WHERE c4 = (SELECT 600))
   ORDER BY 1, 2;
+--Testcase 168:
 SELECT t1.c1, (SELECT c2 FROM f_test_tbl1 WHERE c1 =(SELECT 500))
   FROM f_test_tbl2 t1, (
     SELECT c1, c2 FROM f_test_tbl2 WHERE c1 > ANY (SELECT 20)) t2
@@ -493,6 +521,7 @@ DELETE FROM f_test_tbl2;
 DELETE FROM f_numbers;
 --Testcase 108:
 DELETE FROM f_enum_t1;
+--Testcase 169:
 DROP FOREIGN TABLE f_test_tbl1;
 --Testcase 109:
 DROP FOREIGN TABLE f_test_tbl2;
