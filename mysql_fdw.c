@@ -2113,52 +2113,41 @@ bind_stmt_params_and_exec(ForeignScanState *node)
 	}
 	else
 	{
-		/*
-		 * Finally execute the query and result will be placed in the array we
-		 * already bind
-		 */
-		if (mysql_stmt_execute(festate->stmt) != 0)
+		/* Check the results of query has warning or not */
+		if(mysql_warning_count(festate->conn) > 0)
 		{
-			mysql_stmt_error_print(festate, "failed to execute the MySQL query");
-		}
-		else
-		{
-			/* Check the results of query has warning or not */
-			if(mysql_warning_count(festate->conn) > 0)
+			MYSQL_RES	*result = NULL;
+
+			if (mysql_query(festate->conn, "SHOW WARNINGS"))
 			{
-				MYSQL_RES	*result = NULL;
+				mysql_error_print(festate->conn);
+			}
+			result = mysql_store_result(festate->conn);
+			if (result)
+			{
+				/*
+				* MySQL provide numbers of rows per table invole in
+				* the statment, but we don't have problem with it
+				* because we are sending separate query per table
+				* in FDW.
+				*/
+				MYSQL_ROW		row;
+				unsigned int	num_fields;
+				unsigned int	i;
 
-				if (mysql_query(festate->conn, "SHOW WARNINGS"))
+				num_fields = mysql_num_fields(result);
+				while ((row = mysql_fetch_row(result)))
 				{
-					mysql_error_print(festate->conn);
-				}
-				result = mysql_store_result(festate->conn);
-				if (result)
-				{
-					/*
-					* MySQL provide numbers of rows per table invole in
-					* the statment, but we don't have problem with it
-					* because we are sending separate query per table
-					* in FDW.
-					*/
-					MYSQL_ROW		row;
-					unsigned int	num_fields;
-					unsigned int	i;
-
-					num_fields = mysql_num_fields(result);
-					while ((row = mysql_fetch_row(result)))
+					for(i = 0; i < num_fields; i++)
 					{
-						for(i = 0; i < num_fields; i++)
-						{
-							/* Check warning of query */
-							if (strcmp(row[i], "Division by 0") == 0)
-								ereport(ERROR,
-											(errcode(ERRCODE_DIVISION_BY_ZERO),
-											errmsg("division by zero")));
-						}
+						/* Check warning of query */
+						if (strcmp(row[i], "Division by 0") == 0)
+							ereport(ERROR,
+										(errcode(ERRCODE_DIVISION_BY_ZERO),
+										errmsg("division by zero")));
 					}
-					mysql_free_result(result);
 				}
+				mysql_free_result(result);
 			}
 		}
 	}

@@ -991,7 +991,7 @@ SELECT d.c1, d.c2, e.c1, e.c2, e.c6, e.c8
  40 | HR             |      |       |            |   
 (15 rows)
 
--- FDW-206; LEFT JOIN LATERAL case should not crash
+-- FDW-206: LEFT JOIN LATERAL case should not crash
 --Testcase 121:
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT * FROM f_mysql_test t1 LEFT JOIN LATERAL (

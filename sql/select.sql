@@ -315,7 +315,7 @@ SELECT d.c1, d.c2, e.c1, e.c2, e.c6, e.c8
 SELECT d.c1, d.c2, e.c1, e.c2, e.c6, e.c8
   FROM f_test_tbl2 d FULL OUTER JOIN l_test_tbl1 e ON d.c1 = e.c8 ORDER BY 1, 3;
 
--- FDW-206; LEFT JOIN LATERAL case should not crash
+-- FDW-206: LEFT JOIN LATERAL case should not crash
 --Testcase 121:
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT * FROM f_mysql_test t1 LEFT JOIN LATERAL (
