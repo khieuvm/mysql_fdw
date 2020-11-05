@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/reloptions.h"
 #if PG_VERSION_NUM >= 120000
@@ -49,9 +50,11 @@
 #include "parser/parsetree.h"
 #include "storage/ipc.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
 
 /* Declarations for dynamic loading */
 PG_MODULE_MAGIC;
@@ -104,9 +107,9 @@ unsigned int ((mysql_warning_count)(MYSQL *mysql));
 
 /*
  * In PG 9.5.1 the number will be 90501,
- * our version is 2.5.4 so number will be 20504
+ * our version is 2.5.5 so number will be 20505
  */
-#define CODE_VERSION   20504
+#define CODE_VERSION   20505
 
 typedef struct MySQLFdwRelationInfo
 {
@@ -189,6 +192,13 @@ static List *mysqlImportForeignSchema(ImportForeignSchemaStmt *stmt,
 									  Oid serverOid);
 #endif
 
+#if PG_VERSION_NUM >= 110000
+static void mysqlBeginForeignInsert(ModifyTableState *mtstate,
+									ResultRelInfo *resultRelInfo);
+static void mysqlEndForeignInsert(EState *estate,
+								  ResultRelInfo *resultRelInfo);
+#endif
+
 /*
  * Helper functions
  */
@@ -211,7 +221,7 @@ static void process_query_params(ExprContext *econtext,
 								 MYSQL_BIND **mysql_bind_buf,
 								 Oid *param_types);
 
-static void create_cursor(ForeignScanState *node);
+static void bind_stmt_params_and_exec(ForeignScanState *node);
 
 void *mysql_dll_handle = NULL;
 static int wait_timeout = WAIT_TIMEOUT;
@@ -219,6 +229,7 @@ static int interactive_timeout = INTERACTIVE_TIMEOUT;
 static void mysql_error_print(MYSQL *conn);
 static void mysql_stmt_error_print(MySQLFdwExecState *festate,
 								   const char *msg);
+static List *getUpdateTargetAttrs(RangeTblEntry *rte);
 
 /*
  * mysql_load_library function dynamically load the mysql's library
@@ -420,6 +431,12 @@ mysql_fdw_handler(PG_FUNCTION_ARGS)
 	fdwroutine->ImportForeignSchema = mysqlImportForeignSchema;
 #endif
 
+#if PG_VERSION_NUM >= 110000
+	/* Partition routing and/or COPY from */
+	fdwroutine->BeginForeignInsert = mysqlBeginForeignInsert;
+	fdwroutine->EndForeignInsert = mysqlEndForeignInsert;
+#endif
+
 	PG_RETURN_POINTER(fdwroutine);
 }
 
@@ -485,7 +502,7 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->query = strVal(list_nth(fsplan->fdw_private, 0));
 	festate->retrieved_attrs = list_nth(fsplan->fdw_private, 1);
 	festate->conn = conn;
-	festate->cursor_exists = false;
+	festate->query_executed = false;
 
 #if PG_VERSION_NUM >= 110000
 	festate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
@@ -547,13 +564,6 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 							 &festate->param_values,
 							 &festate->param_types);
 
-	/*
-	 * If this is the first call after Begin or ReScan, we need to create the
-	 * cursor on the remote side.
-	 */
-	if (!festate->cursor_exists)
-		create_cursor(node);
-
 	/* int column_count = mysql_num_fields(festate->meta); */
 
 	/* Set the statement as cursor type */
@@ -596,55 +606,6 @@ mysqlBeginForeignScan(ForeignScanState *node, int eflags)
 	/* Bind the results pointers for the prepare statements */
 	if (mysql_stmt_bind_result(festate->stmt, festate->table->mysql_bind) != 0)
 		mysql_stmt_error_print(festate, "failed to bind the MySQL query");
-
-	/*
-	 * Finally execute the query and result will be placed in the array we
-	 * already bind
-	 */
-	if (mysql_stmt_execute(festate->stmt) != 0)
-	{
-		mysql_stmt_error_print(festate, "failed to execute the MySQL query");
-	}
-	else
-	{
-		/* Check the results of query has warning or not */
-		if(mysql_warning_count(festate->conn) > 0)
-		{
-			MYSQL_RES	*result = NULL;
-
-			if (mysql_query(festate->conn, "SHOW WARNINGS"))
-			{
-				mysql_error_print(festate->conn);
-			}
-			result = mysql_store_result(festate->conn);
-			if (result)
-			{
-				/*
-				 * MySQL provide numbers of rows per table invole in
-				 * the statment, but we don't have problem with it
-				 * because we are sending separate query per table
-				 * in FDW.
-				 */
-				MYSQL_ROW		row;
-				unsigned int	num_fields;
-				unsigned int	i;
-
-				num_fields = mysql_num_fields(result);
-				while ((row = mysql_fetch_row(result)))
-				{
-					for(i = 0; i < num_fields; i++)
-					{
-						/* Check warning of query */
-						if (strcmp(row[i], "Division by 0") == 0)
-							ereport(ERROR,
-										(errcode(ERRCODE_DIVISION_BY_ZERO),
-										errmsg("division by zero")));
-					}
-				}
-				mysql_free_result(result);
-			}
-		}
-	}
 }
 
 /*
@@ -666,6 +627,13 @@ mysqlIterateForeignScan(ForeignScanState *node)
 	memset(tupleSlot->tts_isnull, true, sizeof(bool) * tupleDescriptor->natts);
 
 	ExecClearTuple(tupleSlot);
+
+	/*
+	 * If this is the first call after Begin or ReScan, we need to bind the
+	 * params and execute the query.
+	 */
+	if (!festate->query_executed)
+		bind_stmt_params_and_exec(node);
 
 	attid = 0;
 	rc = mysql_stmt_fetch(festate->stmt);
@@ -792,12 +760,12 @@ mysqlReScanForeignScan(ForeignScanState *node)
 {
 	MySQLFdwExecState *festate = (MySQLFdwExecState *) node->fdw_state;
 
-	/* If we haven't created the cursor yet, nothing to do. */
-	if (!festate->cursor_exists)
-		return;
+	/*
+	 * Set the query_executed flag to false so that the query will be executed
+	 * in mysqlIterateForeignScan().
+	 */
+	festate->query_executed = false;
 
-	if (mysql_stmt_execute(festate->stmt) != 0)
-		mysql_stmt_error_print(festate, "failed to execute the MySQL query");
 }
 
 /*
@@ -1034,7 +1002,7 @@ mysqlGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 									 startup_cost,
 									 total_cost,
 									 NIL,	/* no pathkeys */
-									 NULL,	/* no outer rel either */
+									 baserel->lateral_relids,
 #if PG_VERSION_NUM >= 90500
 									 NULL,	/* no extra plan */
 #endif
@@ -1285,10 +1253,31 @@ mysqlPlanForeignModify(PlannerInfo *root,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 				 errmsg("first column of remote table must be unique for INSERT/UPDATE/DELETE operation")));
 
-	if (operation == CMD_INSERT)
+	/*
+	 * In an INSERT, we transmit all columns that are defined in the foreign
+	 * table.  In an UPDATE, if there are BEFORE ROW UPDATE triggers on the
+	 * foreign table, we transmit all columns like INSERT; else we transmit
+	 * only columns that were explicitly targets of the UPDATE, so as to avoid
+	 * unnecessary data transmission.  (We can't do that for INSERT since we
+	 * would miss sending default values for columns not listed in the source
+	 * statement, and for UPDATE if there are BEFORE ROW UPDATE triggers since
+	 * those triggers might change values for non-target columns, in which
+	 * case we would miss sending changed values for those columns.)
+	 */
+	if (operation == CMD_INSERT ||
+		(operation == CMD_UPDATE &&
+		 rel->trigdesc &&
+		 rel->trigdesc->trig_update_before_row))
 	{
 		TupleDesc	tupdesc = RelationGetDescr(rel);
 		int			attnum;
+
+		/*
+		 * If it is an UPDATE operation, check for row identifier column in
+		 * target attribute list by calling getUpdateTargetAttrs().
+		 */
+		if (operation == CMD_UPDATE)
+			getUpdateTargetAttrs(rte);
 
 		for (attnum = 1; attnum <= tupdesc->natts; attnum++)
 		{
@@ -1300,27 +1289,7 @@ mysqlPlanForeignModify(PlannerInfo *root,
 	}
 	else if (operation == CMD_UPDATE)
 	{
-#if PG_VERSION_NUM >= 90500
-		Bitmapset  *tmpset = bms_copy(rte->updatedCols);
-#else
-		Bitmapset  *tmpset = bms_copy(rte->modifiedCols);
-#endif
-		AttrNumber	col;
-
-		while ((col = bms_first_member(tmpset)) >= 0)
-		{
-			col += FirstLowInvalidHeapAttributeNumber;
-			if (col <= InvalidAttrNumber)	/* shouldn't happen */
-				elog(ERROR, "system-column update is not supported");
-
-			/*
-			 * We also disallow updates to the first column
-			 */
-			if (col == 1)		/* shouldn't happen */
-				elog(ERROR, "row identifier column update is not supported");
-
-			targetAttrs = lappend_int(targetAttrs, col);
-		}
+		targetAttrs = getUpdateTargetAttrs(rte);
 		/* We also want the rowid column to be available for the update */
 		targetAttrs = lcons_int(1, targetAttrs);
 	}
@@ -1536,6 +1505,10 @@ mysqlExecForeignUpdate(EState *estate,
 	Datum		value;
 	int			n_params;
 	bool	   *isnull;
+	Datum		new_value;
+	HeapTuple	tuple;
+	Form_pg_attribute attr;
+	bool		found_row_id_col = false;
 
 	n_params = list_length(fmstate->retrieved_attrs);
 
@@ -1548,9 +1521,16 @@ mysqlExecForeignUpdate(EState *estate,
 		int			attnum = lfirst_int(lc);
 		Oid			type;
 
-		/* first attribute cannot be in target list attribute */
+		/*
+		 * The first attribute cannot be in the target list attribute.  Set the
+		 * found_row_id_col to true once we find it so that we can fetch the
+		 * value later.
+		 */
 		if (attnum == 1)
+		{
+			found_row_id_col = true;
 			continue;
+		}
 
 		type = TupleDescAttr(slot->tts_tupleDescriptor, attnum - 1)->atttypid;
 		value = slot_getattr(slot, attnum, (bool *) (&isnull[bindnum]));
@@ -1560,9 +1540,62 @@ mysqlExecForeignUpdate(EState *estate,
 		bindnum++;
 	}
 
-	/* Get the id that was passed up as a resjunk column */
+	/*
+	 * Since we add a row identifier column in the target list always, so
+	 * found_row_id_col flag should be true.
+	 */
+	if (!found_row_id_col)
+		elog(ERROR, "missing row identifier column value in UPDATE");
+
+	new_value = slot_getattr(slot, 1, &is_null);
+
+	/*
+	 * Get the row identifier column value that was passed up as a resjunk
+	 * column and compare that value with the new value to identify if that
+	 * value is changed.
+	 */
 	value = ExecGetJunkAttribute(planSlot, 1, &is_null);
-	typeoid = get_atttype(foreignTableId, 1);
+
+	tuple = SearchSysCache2(ATTNUM,
+							ObjectIdGetDatum(foreignTableId),
+							Int16GetDatum(1));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+			 1, foreignTableId);
+
+	attr = (Form_pg_attribute) GETSTRUCT(tuple);
+	typeoid = attr->atttypid;
+
+	if (DatumGetPointer(new_value) != NULL && DatumGetPointer(value) != NULL)
+	{
+		Datum		n_value = new_value;
+		Datum 		o_value = value;
+
+		/* If the attribute type is varlena then need to detoast the datums. */
+		if (attr->attlen == -1)
+		{
+			n_value = PointerGetDatum(PG_DETOAST_DATUM(new_value));
+			o_value = PointerGetDatum(PG_DETOAST_DATUM(value));
+		}
+
+		if (!datumIsEqual(o_value, n_value, attr->attbyval, attr->attlen))
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("row identifier column update is not supported")));
+
+		/* Free memory if it's a copy made above */
+		if (DatumGetPointer(n_value) != DatumGetPointer(new_value))
+			pfree(DatumGetPointer(n_value));
+		if (DatumGetPointer(o_value) != DatumGetPointer(value))
+			pfree(DatumGetPointer(o_value));
+	}
+	else if (!(DatumGetPointer(new_value) == NULL &&
+			   DatumGetPointer(value) == NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("row identifier column update is not supported")));
+
+	ReleaseSysCache(tuple);
 
 	/* Bind qual */
 	mysql_bind_sql_var(typeoid, bindnum, value, mysql_bind_buffer, &is_null);
@@ -1753,7 +1786,7 @@ mysqlImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					 "  t.TABLE_NAME,"
 					 "  c.COLUMN_NAME,"
 					 "  CASE"
-					 "    WHEN c.DATA_TYPE = 'enum' THEN LOWER(CONCAT(c.COLUMN_NAME, '_t'))"
+					 "    WHEN c.DATA_TYPE = 'enum' THEN LOWER(CONCAT(t.TABLE_NAME, '_', c.COLUMN_NAME, '_t'))"
 					 "    WHEN c.DATA_TYPE = 'tinyint' THEN 'smallint'"
 					 "    WHEN c.DATA_TYPE = 'mediumint' THEN 'integer'"
 					 "    WHEN c.DATA_TYPE = 'tinyint unsigned' THEN 'smallint'"
@@ -1903,6 +1936,39 @@ mysqlImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 }
 #endif
 
+#if PG_VERSION_NUM >= 110000
+/*
+ * mysqlBeginForeignInsert
+ * 		Prepare for an insert operation triggered by partition routing
+ * 		or COPY FROM.
+ *
+ * This is not yet supported, so raise an error.
+ */
+static void
+mysqlBeginForeignInsert(ModifyTableState *mtstate,
+						ResultRelInfo *resultRelInfo)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+			 errmsg("COPY and foreign partition routing not supported in mysql_fdw")));
+}
+
+/*
+ * mysqlEndForeignInsert
+ * 		BeginForeignInsert() is not yet implemented, hence we do not
+ * 		have anything to cleanup as of now. We throw an error here just
+ * 		to make sure when we do that we do not forget to cleanup
+ * 		resources.
+ */
+static void
+mysqlEndForeignInsert(EState *estate, ResultRelInfo *resultRelInfo)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+			 errmsg("COPY and foreign partition routing not supported in mysql_fdw")));
+}
+#endif
+
 /*
  * Prepare for processing of parameters used in remote query.
  */
@@ -2000,10 +2066,11 @@ process_query_params(ExprContext *econtext,
 }
 
 /*
- * Create cursor for node's query with current parameter values.
+ * Process the query params and bind the same with the statement, if any.
+ * Also, execute the statement.
  */
 static void
-create_cursor(ForeignScanState *node)
+bind_stmt_params_and_exec(ForeignScanState *node)
 {
 	MySQLFdwExecState *festate = (MySQLFdwExecState *) node->fdw_state;
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
@@ -2033,11 +2100,61 @@ create_cursor(ForeignScanState *node)
 
 		mysql_stmt_bind_param(festate->stmt, mysql_bind_buffer);
 
-		/* Mark the cursor as created, and show no tuples have been retrieved */
-		festate->cursor_exists = true;
-
 		MemoryContextSwitchTo(oldcontext);
 	}
+
+	/*
+	 * Finally, execute the query. The result will be placed in the array we
+	 * already bind.
+	 */
+	if (mysql_stmt_execute(festate->stmt) != 0)
+	{
+		mysql_stmt_error_print(festate, "failed to execute the MySQL query");
+	}
+	else
+	{
+		/* Check the results of query has warning or not */
+		if(mysql_warning_count(festate->conn) > 0)
+		{
+			MYSQL_RES	*result = NULL;
+
+			if (mysql_query(festate->conn, "SHOW WARNINGS"))
+			{
+				mysql_error_print(festate->conn);
+			}
+			result = mysql_store_result(festate->conn);
+			if (result)
+			{
+				/*
+				* MySQL provide numbers of rows per table invole in
+				* the statment, but we don't have problem with it
+				* because we are sending separate query per table
+				* in FDW.
+				*/
+				MYSQL_ROW		row;
+				unsigned int	num_fields;
+				unsigned int	i;
+
+				num_fields = mysql_num_fields(result);
+				while ((row = mysql_fetch_row(result)))
+				{
+					for(i = 0; i < num_fields; i++)
+					{
+						/* Check warning of query */
+						if (strcmp(row[i], "Division by 0") == 0)
+							ereport(ERROR,
+										(errcode(ERRCODE_DIVISION_BY_ZERO),
+										errmsg("division by zero")));
+					}
+				}
+				mysql_free_result(result);
+			}
+		}
+	}
+	
+
+	/* Mark the query as executed */
+	festate->query_executed = true;
 }
 
 Datum
@@ -2099,4 +2216,38 @@ mysql_stmt_error_print(MySQLFdwExecState *festate, const char *msg)
 					 errmsg("%s: \n%s", msg, mysql_error(festate->conn))));
 			break;
 	}
+}
+
+/*
+ * getUpdateTargetAttrs
+ * 		Returns the list of attribute numbers of the columns being updated.
+ */
+static List *
+getUpdateTargetAttrs(RangeTblEntry *rte)
+{
+	List	   *targetAttrs = NIL;
+
+#if PG_VERSION_NUM >= 90500
+	Bitmapset  *tmpset = bms_copy(rte->updatedCols);
+#else
+	Bitmapset  *tmpset = bms_copy(rte->modifiedCols);
+#endif
+	AttrNumber	col;
+
+	while ((col = bms_first_member(tmpset)) >= 0)
+	{
+		col += FirstLowInvalidHeapAttributeNumber;
+		if (col <= InvalidAttrNumber)	/* shouldn't happen */
+			elog(ERROR, "system-column update is not supported");
+
+		/* We also disallow updates to the first column */
+		if (col == 1)
+			ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("row identifier column update is not supported")));
+
+		targetAttrs = lappend_int(targetAttrs, col);
+	}
+
+	return targetAttrs;
 }

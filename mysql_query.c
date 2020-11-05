@@ -20,7 +20,6 @@
 #include "mysql_fdw.h"
 
 #include <mysql.h>
-#include <mysql_com.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -148,6 +147,7 @@ mysql_from_pgtyp(Oid type)
 		case VARCHAROID:
 		case TEXTOID:
 		case JSONOID:
+		case ANYENUMOID:
 			return MYSQL_TYPE_STRING;
 		case NAMEOID:
 			return MYSQL_TYPE_STRING;
@@ -182,12 +182,25 @@ mysql_bind_sql_var(Oid type, int attnum, Datum value, MYSQL_BIND *binds,
 	/* Clear the bind buffer and attributes */
 	memset(&binds[attnum], 0x0, sizeof(MYSQL_BIND));
 
-	binds[attnum].buffer_type = mysql_from_pgtyp(type);
+#if MYSQL_VERSION_ID < 80000 || MARIADB_VERSION_ID >= 100000
+	binds[attnum].is_null = (my_bool *) isnull;
+#else
 	binds[attnum].is_null = isnull;
+#endif
 
 	/* Avoid to bind buffer in case value is NULL */
 	if (*isnull)
 		return;
+
+	/*
+	 * If type is an enum, use ANYENUMOID.  We will send string containing the
+	 * enum value to the MySQL.
+	 */
+	if (type_is_enum(type))
+		type = ANYENUMOID;
+
+	/* Assign the buffer type if value is not null */
+	binds[attnum].buffer_type = mysql_from_pgtyp(type);
 
 	switch (type)
 	{
@@ -270,6 +283,7 @@ mysql_bind_sql_var(Oid type, int attnum, Datum value, MYSQL_BIND *binds,
 		case VARCHAROID:
 		case TEXTOID:
 		case JSONOID:
+		case ANYENUMOID:
 			{
 				char	   *outputString = NULL;
 				Oid			outputFunctionId = InvalidOid;
@@ -397,9 +411,14 @@ mysql_bind_result(Oid pgtyp, int pgtypmod, MYSQL_FIELD *field,
 {
 	MYSQL_BIND *mbind = column->mysql_bind;
 
+#if MYSQL_VERSION_ID < 80000 || MARIADB_VERSION_ID >= 100000
+	mbind->is_null = (my_bool *) &column->is_null;
+	mbind->error = (my_bool *) &column->error;
+#else
 	mbind->is_null = &column->is_null;
-	mbind->length = &column->length;
 	mbind->error = &column->error;
+#endif
+	mbind->length = &column->length;
 
 	switch (pgtyp)
 	{
