@@ -1,7 +1,4 @@
-\set MYSQL_HOST			'\'localhost\''
-\set MYSQL_PORT			'\'3306\''
-\set MYSQL_USER_NAME	'\'edb\''
-\set MYSQL_PASS			'\'edb\''
+\set ECHO none
 -- Before running this file User must create database mysql_fdw_regress on
 -- mysql with all permission for 'edb' user with 'edb' password and ran
 -- mysql_init.sh file to create tables.

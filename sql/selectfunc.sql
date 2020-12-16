@@ -1,12 +1,17 @@
 SET datestyle=ISO;
 SET timezone='Japan';
+\set ECHO none
+\ir sql/parameters.conf
+\set ECHO all
 
 --Testcase 1:
 CREATE EXTENSION mysql_fdw;
 --Testcase 2:
-CREATE SERVER server1 FOREIGN DATA WRAPPER mysql_fdw;
+CREATE SERVER server1 FOREIGN DATA WRAPPER mysql_fdw
+  OPTIONS (host :MYSQL_HOST, port :MYSQL_PORT);
 --Testcase 3:
-CREATE USER MAPPING FOR CURRENT_USER SERVER server1 OPTIONS(username 'edb', password 'edb');
+CREATE USER MAPPING FOR CURRENT_USER SERVER server1
+  OPTIONS (username :MYSQL_USER_NAME, password :MYSQL_PASS);
 
 --IMPORT FOREIGN SCHEMA public FROM SERVER server1 INTO public OPTIONS(import_time_text 'false');
 --Testcase 4:
